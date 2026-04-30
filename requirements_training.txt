@@ -1,0 +1,6 @@
+# Training machine (Linux/Windows/macOS, GPU recommended)
+torch>=2.2.0
+torchaudio>=2.2.0
+onnx>=1.16.0
+onnxruntime>=1.18.0          # CPU-only; use onnxruntime-gpu for GPU machines
+numpy>=1.26.0

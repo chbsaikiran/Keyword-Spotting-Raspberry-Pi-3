@@ -1,0 +1,15 @@
+# Raspberry Pi 3 — 64-bit OS (Raspberry Pi OS 64-bit or Ubuntu 22.04 arm64)
+# Install: pip install -r requirements_rpi.txt
+#
+# NOTE: onnxruntime 1.18+ provides official aarch64 wheels.
+#   64-bit OS: pip install onnxruntime            (official wheel works)
+#   32-bit OS: pip install onnxruntime-rpi         (community build)
+#              or build from source (slow, ~2 h on RPi3):
+#              https://onnxruntime.ai/docs/build/inferencing.html
+
+onnxruntime>=1.18.0
+numpy>=1.26.0
+librosa>=0.10.0          # mel spectrogram; pulls in scipy, soundfile, numba
+sounddevice>=0.4.6       # real-time microphone capture
+soundfile>=0.12.0        # reading wav/flac audio files
+scipy>=1.12.0            # fallback STFT if librosa is unavailable
