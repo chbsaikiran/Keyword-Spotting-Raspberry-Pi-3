@@ -240,6 +240,42 @@ def apply_awq_scales(
 
 # ── TFLite export ─────────────────────────────────────────────────────────────
 
+def _strip_constant_inputs(tflite_bytes: bytes) -> bytes:
+    """
+    Remove buffer-backed (constant) tensors from the subgraph inputs list.
+
+    litert-torch / PT2E lifts model weights as graph inputs. ai_edge_quantizer
+    quantises them to INT8 constants but leaves them in the inputs list.
+    Newer tf.lite auto-initialises those tensors from their flatbuffer buffer;
+    older tflite_runtime (e.g. RPi 3) requires every declared input to be
+    provided via set_tensor() and raises 'Input tensor N lacks data' instead.
+
+    A tensor with a non-empty buffer is a constant — not a true external input.
+    Removing it from the inputs list fixes the RPi error while keeping the
+    embedded weight data intact.
+    """
+    try:
+        from tensorflow.lite.tools import flatbuffer_utils as fbu
+        model = fbu.convert_bytearray_to_object(bytearray(tflite_bytes))
+        removed = 0
+        for sg in model.subgraphs:
+            kept = []
+            for tensor_idx in sg.inputs:
+                buf = model.buffers[sg.tensors[tensor_idx].buffer]
+                if buf.data is not None and len(buf.data) > 0:
+                    removed += 1   # constant weight — drop from inputs list
+                else:
+                    kept.append(tensor_idx)   # true user input — keep
+            sg.inputs = kept
+        if removed:
+            print(f"  Stripped {removed} constant tensor(s) from inputs list "
+                  f"(tflite_runtime compatibility fix).")
+        return bytes(fbu.convert_object_to_bytearray(model))
+    except Exception as exc:
+        print(f"  [Warning] Could not strip constant inputs: {exc}")
+        return tflite_bytes
+
+
 def export_tflite(model: nn.Module, tflite_path: str):
     """AWQ-transformed PyTorch model → TFLite INT8 via litert-torch + ai_edge_quantizer."""
     model = model.eval()
@@ -255,6 +291,7 @@ def export_tflite(model: nn.Module, tflite_path: str):
         granularity=aq.qtyping.QuantGranularity.CHANNELWISE,
     )
     int8_bytes = qt.quantize().quantized_model
+    int8_bytes = _strip_constant_inputs(bytes(int8_bytes))
 
     os.makedirs(os.path.dirname(os.path.abspath(tflite_path)), exist_ok=True)
     with open(tflite_path, "wb") as f:

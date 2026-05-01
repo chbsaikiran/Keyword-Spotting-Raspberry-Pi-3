@@ -17,6 +17,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import time
 
 import numpy as np
@@ -149,39 +150,67 @@ class AWQSpotter:
         )
         self.interpreter.allocate_tensors()
 
-        n_mels     = self.cfg["n_mels"]
-        max_frames = self.cfg["max_frames"]
-        input_details = self.interpreter.get_input_details()
-        self._out_idx = self.interpreter.get_output_details()[0]["index"]
+        n_mels, max_frames = self.cfg["n_mels"], self.cfg["max_frames"]
 
-        self._inp_idx      = None
+        input_details  = self.interpreter.get_input_details()
+        self._out_idx  = self.interpreter.get_output_details()[0]["index"]
+
+        # First declared input is always the mel spectrogram.
+        self._inp_idx      = input_details[0]["index"]
         self._extra_inputs = []  # [(tensor_index, numpy_data), ...]
 
-        for det in input_details:
-            shape = list(det["shape"])
-            if shape == [1, max_frames, n_mels]:
-                self._inp_idx = det["index"]
-            else:
-                # Extra input — typically the learnable cls_token parameter
-                # exported as a graph input by PT2E/litert-torch.
-                if "cls_token" in self.cfg:
-                    data = np.array(self.cfg["cls_token"], dtype=np.float32)
-                else:
-                    data = np.zeros(shape, dtype=np.float32)
-                    print(
-                        f"[AWQ] Warning: extra input (idx={det['index']}, shape={shape}) "
-                        f"not in config — feeding zeros. Re-run quantize_awq.py on the "
-                        f"training machine to embed the trained cls_token value."
-                    )
-                self._extra_inputs.append((det["index"], data))
+        # Any additional declared inputs (shape != mel) are extra parameters.
+        mel_shape = [1, max_frames, n_mels]
+        for det in input_details[1:]:
+            shape = [int(x) for x in det["shape"]]
+            self._extra_inputs.append((det["index"],
+                                       self._make_cls_data(shape, det["dtype"])))
 
-        if self._inp_idx is None:
-            self._inp_idx = input_details[0]["index"]
+        # Build a lookup from index → tensor detail for the probe below.
+        td_by_idx: dict = {}
+        try:
+            for td in self.interpreter.get_tensor_details():
+                td_by_idx[td["index"]] = td
+        except AttributeError:
+            pass
 
-        inp_shape = self.interpreter.get_input_details()[0]["shape"]
+        # ── Probe invoke: verify the model runs cleanly with a dummy input.   ──
+        # ── If it raises 'Input tensor N lacks data', the .tflite was built  ──
+        # ── with an old quantize_awq.py that left weight tensors in the      ──
+        # ── subgraph inputs list.  Re-run quantize_awq.py to fix the model.  ──
+        dummy = np.zeros([1, max_frames, n_mels], dtype=np.float32)
+        self.interpreter.set_tensor(self._inp_idx, dummy)
+        for idx, data in self._extra_inputs:
+            self.interpreter.set_tensor(idx, data)
+        try:
+            self.interpreter.invoke()
+        except RuntimeError as exc:
+            m = re.search(r'Input tensor (\d+) lacks data', str(exc))
+            if m:
+                raise RuntimeError(
+                    f"\n\nInput tensor {m.group(1)} lacks data.\n"
+                    f"The TFLite model was built with an old version of "
+                    f"quantize_awq.py that left weight tensors in the "
+                    f"subgraph inputs list.\n"
+                    f"Fix: re-run  python quantize_awq.py  on the training "
+                    f"machine, copy the new checkpoints/ files to the Pi, "
+                    f"then retry."
+                ) from exc
+            raise
+
         print(f"[AWQ] Loaded: {model_path}")
-        print(f"  Input shape : {inp_shape}")
+        print(f"  Input shape  : {mel_shape}")
+        print(f"  Extra inputs : {len(self._extra_inputs)}")
         print(f"  Classes ({len(self.keywords)}): {', '.join(self.keywords)}")
+
+    def _make_cls_data(self, shape: list, dtype) -> np.ndarray:
+        """Return the cls_token array (from config) or zeros, cast to dtype."""
+        n = int(np.prod(shape)) if shape else 1
+        if "cls_token" in self.cfg:
+            flat = np.array(self.cfg["cls_token"], dtype=np.float32).flatten()
+            if flat.size == n:
+                return flat.reshape(shape).astype(dtype)
+        return np.zeros(shape, dtype=dtype)
 
     def predict(self, wave: np.ndarray) -> tuple:
         t0      = time.perf_counter()
