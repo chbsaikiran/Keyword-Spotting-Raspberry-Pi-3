@@ -244,72 +244,39 @@ def apply_awq_scales(
 
 def _fix_hidden_inputs(int8_bytes: bytes) -> bytes:
     """
-    Remove weight tensors from the subgraph inputs list via a targeted
-    in-place binary patch.
-
-    litert-torch / PT2E lifts model parameters as graph inputs.
-    ai_edge_quantizer quantises them to INT8 constants but keeps them in the
-    subgraph inputs list.  Newer tf.lite auto-initialises these from the
-    embedded flatbuffer buffer; older tflite_runtime on RPi 3 requires every
-    declared input to be supplied via set_tensor() and raises
-    'Input tensor N lacks data' without them.
-
-    We patch only the 4-byte count field of the inputs vector — no
-    re-serialisation, no buffer data touched.  The weight tensors remain as
-    embedded constants; they just stop being declared as external inputs.
+    Properly remove weight tensors from subgraph inputs using FlatBuffer rewrite.
+    This is robust and does NOT rely on byte-pattern matching.
     """
     try:
         from tensorflow.lite.python import schema_py_generated as schema_fb
     except ImportError:
-        print("  [Warning] schema_py_generated unavailable — "
-              "skipping hidden-input patch (Pi may raise 'lacks data').")
+        print("  [ERROR] schema_py_generated not available")
         return int8_bytes
 
-    raw_model  = schema_fb.ModelT.InitFromPackedBuf(bytearray(int8_bytes), 0)
-    raw_inputs = list(raw_model.subgraphs[0].inputs)   # full flatbuffer list
+    # Parse model
+    model = schema_fb.ModelT.InitFromPackedBuf(bytearray(int8_bytes), 0)
+    subgraph = model.subgraphs[0]
 
-    interp = tf.lite.Interpreter(model_content=bytes(int8_bytes))
-    interp.allocate_tensors()
-    py_inputs = {d["index"] for d in interp.get_input_details()}
+    # Keep ONLY the first input (mel spectrogram)
+    original_inputs = list(subgraph.inputs)
 
-    hidden = [idx for idx in raw_inputs if idx not in py_inputs]
-    if not hidden:
-        print("  No hidden inputs found — model is already clean.")
+    if len(original_inputs) <= 1:
+        print("  Model already clean (single input).")
         return int8_bytes
 
-    print(f"  Hidden weight tensor(s) in inputs list: {hidden}")
+    print(f"  Original inputs: {original_inputs}")
 
-    # Build the exact byte pattern for the inputs vector as it sits in the
-    # flatbuffer: [uint32 count][int32 tensor_0][int32 tensor_1]...
-    # raw_inputs order matches the flatbuffer storage order.
-    pattern = struct.pack("<I", len(raw_inputs))
-    for idx in raw_inputs:
-        pattern += struct.pack("<i", idx)
+    # Keep only first input
+    subgraph.inputs = [original_inputs[0]]
 
-    buf     = bytearray(int8_bytes)
-    found   = []
+    print(f"  Fixed inputs → {[original_inputs[0]]}")
 
-    # Flatbuffers aligns all table data to 4 bytes — search on that boundary.
-    for i in range(0, len(buf) - len(pattern) + 1, 4):
-        if buf[i : i + len(pattern)] == pattern:
-            found.append(i)
+    # Rebuild flatbuffer
+    builder = schema_fb.flatbuffers.Builder(0)
+    builder.Finish(model.Pack(builder))
+    fixed_bytes = bytes(builder.Output())
 
-    # Fallback: byte-by-byte in case alignment differs.
-    if not found:
-        for i in range(len(buf) - len(pattern) + 1):
-            if buf[i : i + len(pattern)] == pattern:
-                found.append(i)
-
-    if len(found) == 1:
-        struct.pack_into("<I", buf, found[0], 1)   # set count = 1 (mel only)
-        print(f"  Patched subgraph inputs: removed {len(hidden)} "
-              f"weight tensor(s) {hidden} — kept only mel tensor.")
-        return bytes(buf)
-
-    print(f"  [Warning] Expected 1 match for inputs-vector pattern, "
-          f"found {len(found)}.  Model left unpatched — Pi will likely "
-          f"fail with 'Input tensor N lacks data'.")
-    return int8_bytes
+    return fixed_bytes
 
 
 def export_tflite(model: nn.Module, tflite_path: str):
