@@ -1,15 +1,11 @@
 # Training machine (Linux/Windows/macOS, GPU recommended)
 
 # Core training
-torch>=2.2.0
-torchaudio>=2.2.0
+torch>=2.3.0
+torchaudio>=2.3.0
 numpy>=1.26.0
 
-# ONNX export + quantization
-onnx>=1.16.0
-onnxruntime>=1.18.0     # CPU-only; use onnxruntime-gpu for GPU machines
-onnxsim                 # ONNX simplifier — folds constants before TFLite conversion
-
-# TFLite conversion  (used by convert_to_tflite.py)
-onnx-tf>=1.10.0         # ONNX → TensorFlow SavedModel
-tensorflow>=2.13.0      # TFLite converter
+# TFLite export + INT8 quantization
+litert-torch            # PyTorch → TFLite via PT2E (replaces onnx-tf pipeline)
+tensorflow>=2.13.0      # TFLite converter + evaluation
+tqdm

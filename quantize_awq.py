@@ -6,18 +6,16 @@ Steps:
   2. Grid-search the optimal per-channel scale alpha for each Linear layer
        scale_j = act_max_j ^ alpha   minimises simulated INT8 weight error
   3. Fold scales into (LayerNorm, Linear) pairs — mathematically lossless
-  4. Export transformed model to ONNX (opset 17)
-  5. ONNX Runtime static INT8 quantization (QDQ, per-channel, reduce_range)
-  6. Accuracy comparison FP32 vs INT8
+  4. Export transformed model to TFLite INT8 via PT2E quantization
 
 Key idea: AWQ protects "salient" weight channels (those whose input activations
 are large and thus have outsized impact on the output) by searching for the
 per-channel scale that minimises the quantisation error specifically for those
 channels.  All scaling is folded into adjacent LayerNorm parameters so the
-ONNX graph is unchanged in structure.
+TFLite graph is unchanged in structure.
 
 Output files (copy both to Raspberry Pi):
-    checkpoints/keyword_spotting_awq_int8.onnx
+    checkpoints/keyword_spotting_awq.tflite
     checkpoints/preprocess_config.json
 """
 
@@ -25,17 +23,11 @@ import copy
 import json
 import os
 
-import numpy as np
-import onnx
-import onnxruntime as ort
 import torch
 import torch.nn as nn
-from onnxruntime.quantization import (
-    CalibrationDataReader,
-    QuantFormat,
-    QuantType,
-    quantize_static,
-)
+import litert_torch as ltt
+import tensorflow as tf
+from ai_edge_quantizer import quantizer as aq
 from torch.utils.data import DataLoader
 
 from train import (
@@ -55,10 +47,9 @@ from train import (
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-CKPT_DIR       = "./checkpoints"
-ONNX_FP32_PATH = f"{CKPT_DIR}/keyword_spotting_awq_fp32.onnx"
-ONNX_INT8_PATH = f"{CKPT_DIR}/keyword_spotting_awq_int8.onnx"
-CONFIG_PATH    = f"{CKPT_DIR}/preprocess_config.json"
+CKPT_DIR    = "./checkpoints"
+TFLITE_PATH = f"{CKPT_DIR}/keyword_spotting_awq.tflite"
+CONFIG_PATH = f"{CKPT_DIR}/preprocess_config.json"
 
 CALIB_BATCHES  = 64
 CALIB_BATCH_SZ = 32
@@ -191,7 +182,7 @@ def compute_awq_scales(
     Compute the optimal AWQ per-input-channel scale for the two Linear layers
     in each decoder block that are most sensitive to quantisation:
         blocks.i.attn.qkv   — receives LayerNorm output before attention
-        blocks.i.ff.net.0   — receives LayerNorm output before FFN
+        blocks.i.ff.net[0]   — receives LayerNorm output before FFN
     """
     awq_scales: dict[str, torch.Tensor] = {}
     for i, block in enumerate(model.blocks):
@@ -247,72 +238,30 @@ def apply_awq_scales(
     return model
 
 
-# ── ONNX export ───────────────────────────────────────────────────────────────
+# ── TFLite export ─────────────────────────────────────────────────────────────
 
-def export_onnx(model: nn.Module, path: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    model.eval()
-    dummy = torch.zeros(1, MAX_FRAMES, N_MELS)
-    torch.onnx.export(
-        model, dummy, path,
-        input_names=["mel"],
-        output_names=["logits"],
-        dynamic_axes={"mel": {0: "batch"}},
-        opset_version=17,
-        do_constant_folding=True,
+def export_tflite(model: nn.Module, tflite_path: str):
+    """AWQ-transformed PyTorch model → TFLite INT8 via litert-torch + ai_edge_quantizer."""
+    model = model.eval()
+    sample = (torch.zeros(1, MAX_FRAMES, N_MELS),)
+
+    fp32_bytes = ltt.convert(model, sample).model_content()
+
+    qt = aq.Quantizer(bytearray(fp32_bytes))
+    qt.add_dynamic_config(
+        regex=".*",
+        operation_name=aq._TFLOpName.FULLY_CONNECTED,
+        num_bits=8,
+        granularity=aq.qtyping.QuantGranularity.CHANNELWISE,
     )
-    onnx.checker.check_model(onnx.load(path))
-    print(f"  Exported: {path}  ({os.path.getsize(path)/1e6:.2f} MB)")
+    int8_bytes = qt.quantize().quantized_model
 
+    os.makedirs(os.path.dirname(os.path.abspath(tflite_path)), exist_ok=True)
+    with open(tflite_path, "wb") as f:
+        f.write(int8_bytes)
 
-# ── ONNX Runtime static INT8 quantization ────────────────────────────────────
-
-class SpeechCalibReader(CalibrationDataReader):
-    def __init__(self, dataloader: DataLoader, n_batches: int):
-        self._iter  = iter(dataloader)
-        self._max   = n_batches
-        self._count = 0
-
-    def get_next(self):
-        if self._count >= self._max:
-            return None
-        try:
-            mel, _ = next(self._iter)
-            self._count += 1
-            return {"mel": mel.numpy()}
-        except StopIteration:
-            return None
-
-
-def quantize_onnx(fp32_path: str, int8_path: str, dataloader: DataLoader):
-    """
-    Static INT8 quantization via ONNX Runtime.
-
-    After AWQ scaling, weight column norms are more uniform, so per-channel
-    INT8 quantisation (the ONNX Runtime default) has less rounding error than
-    it would on the raw un-scaled model.
-
-    reduce_range=True avoids ARM NEON 8-bit multiply accumulation overflow
-    on Raspberry Pi 3.
-    """
-    reader = SpeechCalibReader(dataloader, CALIB_BATCHES)
-    quantize_static(
-        model_input=fp32_path,
-        model_output=int8_path,
-        calibration_data_reader=reader,
-        quant_format=QuantFormat.QDQ,
-        activation_type=QuantType.QInt8,
-        weight_type=QuantType.QInt8,
-        per_channel=True,
-        reduce_range=True,
-        op_types_to_quantize=["MatMul", "Gemm"],
-        extra_options={
-            "ActivationSymmetric": True,
-            "WeightSymmetric": True,
-            "EnableSubgraph": False,
-        },
-    )
-    print(f"  Quantized: {int8_path}  ({os.path.getsize(int8_path)/1e6:.2f} MB)")
+    size_mb = os.path.getsize(tflite_path) / 1e6
+    print(f"  Saved: {tflite_path}  ({size_mb:.2f} MB)")
 
 
 # ── Evaluation helpers ────────────────────────────────────────────────────────
@@ -330,18 +279,22 @@ def eval_pytorch(model: nn.Module, dataloader: DataLoader, n: int = 30) -> float
     return correct / total
 
 
-def eval_onnx(path: str, dataloader: DataLoader, n: int = 30) -> float:
-    opts = ort.SessionOptions()
-    opts.intra_op_num_threads = 1
-    sess    = ort.InferenceSession(path, opts, providers=["CPUExecutionProvider"])
+def eval_tflite(tflite_path: str, dataloader: DataLoader, n: int = 30) -> float:
+    interp = tf.lite.Interpreter(model_path=tflite_path)
+    interp.allocate_tensors()
+    inp_idx = interp.get_input_details()[0]["index"]
+    out_idx = interp.get_output_details()[0]["index"]
+
     correct = total = 0
     for i, (mel, labels) in enumerate(dataloader):
         if i >= n:
             break
-        logits   = sess.run(None, {"mel": mel.numpy()})[0]
-        preds    = logits.argmax(axis=1)
-        correct += (preds == labels.numpy()).sum()
-        total   += labels.shape[0]
+        for j in range(mel.shape[0]):
+            interp.set_tensor(inp_idx, mel[j : j + 1].numpy())
+            interp.invoke()
+            logits = interp.get_tensor(out_idx)[0]
+            correct += int(logits.argmax() == labels[j].item())
+            total += 1
     return correct / total
 
 
@@ -385,23 +338,17 @@ def main():
         "AWQ broke mathematical equivalence — check apply_awq_scales()"
     )
 
-    # ── Step 4: Export to ONNX ────────────────────────────────────────────────
-    print("[4/4] Exporting to ONNX (opset 17)...")
-    export_onnx(model_awq, ONNX_FP32_PATH)
-
-    # ── Step 5: Static INT8 quantization ─────────────────────────────────────
-    print("Running ONNX Runtime static INT8 quantization...")
-    quant_dl = DataLoader(ds, CALIB_BATCH_SZ, shuffle=False,
-                          num_workers=0, collate_fn=collate_fn)
-    quantize_onnx(ONNX_FP32_PATH, ONNX_INT8_PATH, quant_dl)
+    # ── Step 4: Export to TFLite INT8 ────────────────────────────────────────
+    print("[4/4] Exporting to TFLite INT8 (PT2E + litert-torch)...")
+    export_tflite(model_awq, TFLITE_PATH)
 
     # ── Accuracy comparison ───────────────────────────────────────────────────
     print("\nValidating (30 batches each)...")
-    acc_fp32 = eval_onnx(ONNX_FP32_PATH, val_dl, n=30)
-    acc_int8 = eval_onnx(ONNX_INT8_PATH, val_dl, n=30)
-    print(f"  FP32 ONNX (AWQ) : {acc_fp32:.4f}")
-    print(f"  INT8 ONNX (AWQ) : {acc_int8:.4f}")
-    print(f"  Accuracy drop   : {acc_fp32 - acc_int8:.4f}")
+    acc_fp32  = eval_pytorch(model_awq, val_dl, n=30)
+    acc_tflite = eval_tflite(TFLITE_PATH, val_dl, n=30)
+    print(f"  FP32  (AWQ) : {acc_fp32:.4f}")
+    print(f"  INT8 TFLite : {acc_tflite:.4f}")
+    print(f"  Accuracy drop: {acc_fp32 - acc_tflite:.4f}")
 
     # ── Save preprocessing config ─────────────────────────────────────────────
     with open(CONFIG_PATH, "w") as f:
@@ -416,7 +363,7 @@ def main():
         )
 
     print(f"\nFiles ready for Raspberry Pi 3:")
-    print(f"  {ONNX_INT8_PATH}")
+    print(f"  {TFLITE_PATH}")
     print(f"  {CONFIG_PATH}")
     print(
         "\nRun on Pi:\n"

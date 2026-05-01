@@ -2,11 +2,10 @@
 Post-training quantization pipeline:
   1. SmoothQuant  — equalize activation/weight ranges via per-channel scaling
   2. AWQ          — activation-aware weight quantization (protect salient channels)
-  3. ONNX export  — opset 17
-  4. ONNX Runtime static INT8 quantization (QDQ format, per-channel weights)
+  3. TFLite INT8 export via PT2E quantization (litert-torch)
 
 Run this on your training machine (GPU or fast CPU), then copy
-  checkpoints/keyword_spotting_int8.onnx
+  checkpoints/keyword_spotting_combined.tflite
   checkpoints/preprocess_config.json
 to the Raspberry Pi.
 """
@@ -14,18 +13,12 @@ to the Raspberry Pi.
 import os
 import copy
 import json
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-import onnx
-import onnxruntime as ort
-from onnxruntime.quantization import (
-    quantize_static,
-    CalibrationDataReader,
-    QuantFormat,
-    QuantType,
-)
+import litert_torch as ltt
+import tensorflow as tf
+from ai_edge_quantizer import quantizer as aq
 
 from train import (
     KeywordSpottingTransformer,
@@ -45,9 +38,7 @@ from train import (
 # ── Paths & constants ─────────────────────────────────────────────────────────
 
 CKPT_DIR        = "./checkpoints"
-ONNX_RAW_PATH   = f"{CKPT_DIR}/keyword_spotting_raw.onnx"
-ONNX_SMOOTH_PATH = f"{CKPT_DIR}/keyword_spotting_smooth.onnx"
-ONNX_QUANT_PATH = f"{CKPT_DIR}/keyword_spotting_int8.onnx"
+TFLITE_PATH     = f"{CKPT_DIR}/keyword_spotting_combined.tflite"
 CONFIG_PATH     = f"{CKPT_DIR}/preprocess_config.json"
 
 CALIB_BATCHES   = 64    # calibration batches for stats collection
@@ -75,7 +66,7 @@ class ActivationCalibrator:
                 )
 
     def _make_hook(self, name: str):
-        def hook(module, inputs, _output):
+        def hook(_module, inputs, _output):
             x = inputs[0].detach().float()          # [..., in_features]
             channel_max = x.reshape(-1, x.shape[-1]).abs().max(dim=0).values
             if name in self.scales:
@@ -239,70 +230,30 @@ def apply_awq_scales(
     return model
 
 
-# ── ONNX export ───────────────────────────────────────────────────────────────
+# ── TFLite INT8 export ────────────────────────────────────────────────────────
 
-def export_onnx(model: nn.Module, path: str):
-    model.eval()
-    dummy = torch.zeros(1, MAX_FRAMES, N_MELS)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.onnx.export(
-        model,
-        dummy,
-        path,
-        input_names=["mel"],
-        output_names=["logits"],
-        dynamic_axes={"mel": {0: "batch"}},
-        opset_version=17,
-        do_constant_folding=True,
+def export_tflite(model: nn.Module, tflite_path: str):
+    """SQ+AWQ-transformed PyTorch model → TFLite INT8 via litert-torch + ai_edge_quantizer."""
+    model = model.eval()
+    sample = (torch.zeros(1, MAX_FRAMES, N_MELS),)
+
+    fp32_bytes = ltt.convert(model, sample).model_content()
+
+    qt = aq.Quantizer(bytearray(fp32_bytes))
+    qt.add_dynamic_config(
+        regex=".*",
+        operation_name=aq._TFLOpName.FULLY_CONNECTED,
+        num_bits=8,
+        granularity=aq.qtyping.QuantGranularity.CHANNELWISE,
     )
-    onnx.checker.check_model(onnx.load(path))
-    size_mb = os.path.getsize(path) / 1e6
-    print(f"  Exported: {path}  ({size_mb:.2f} MB)")
+    int8_bytes = qt.quantize().quantized_model
 
+    os.makedirs(os.path.dirname(os.path.abspath(tflite_path)), exist_ok=True)
+    with open(tflite_path, "wb") as f:
+        f.write(int8_bytes)
 
-# ── ONNX Runtime static INT8 quantization ────────────────────────────────────
-
-class SpeechCalibReader(CalibrationDataReader):
-    def __init__(self, dataloader: DataLoader, n_batches: int):
-        self._iter     = iter(dataloader)
-        self._n        = n_batches
-        self._count    = 0
-
-    def get_next(self):
-        if self._count >= self._n:
-            return None
-        try:
-            mel, _ = next(self._iter)
-            self._count += 1
-            return {"mel": mel.numpy()}
-        except StopIteration:
-            return None
-
-    def rewind(self):
-        self._count = 0
-
-
-def quantize_onnx_int8(raw_path: str, quant_path: str, dataloader: DataLoader):
-    reader = SpeechCalibReader(dataloader, CALIB_BATCHES)
-    quantize_static(
-        model_input=raw_path,
-        model_output=quant_path,
-        calibration_data_reader=reader,
-        quant_format=QuantFormat.QDQ,
-        activation_type=QuantType.QInt8,
-        weight_type=QuantType.QInt8,
-        per_channel=True,
-        # reduce_range avoids INT8 overflow on ARM NEON accumulators (RPi3)
-        reduce_range=True,
-        op_types_to_quantize=["MatMul", "Gemm"],
-        extra_options={
-            "ActivationSymmetric": True,
-            "WeightSymmetric": True,
-            "EnableSubgraph": False,
-        },
-    )
-    size_mb = os.path.getsize(quant_path) / 1e6
-    print(f"  Quantized: {quant_path}  ({size_mb:.2f} MB)")
+    size_mb = os.path.getsize(tflite_path) / 1e6
+    print(f"  Saved: {tflite_path}  ({size_mb:.2f} MB)")
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
@@ -320,18 +271,22 @@ def eval_pytorch(model: nn.Module, dataloader: DataLoader, n_batches: int = 30) 
     return correct / total
 
 
-def eval_onnx(path: str, dataloader: DataLoader, n_batches: int = 30) -> float:
-    opts = ort.SessionOptions()
-    opts.intra_op_num_threads = 1
-    sess    = ort.InferenceSession(path, opts, providers=["CPUExecutionProvider"])
+def eval_tflite(tflite_path: str, dataloader: DataLoader, n: int = 30) -> float:
+    interp = tf.lite.Interpreter(model_path=tflite_path)
+    interp.allocate_tensors()
+    inp_idx = interp.get_input_details()[0]["index"]
+    out_idx = interp.get_output_details()[0]["index"]
+
     correct = total = 0
     for i, (mel, labels) in enumerate(dataloader):
-        if i >= n_batches:
+        if i >= n:
             break
-        logits   = sess.run(None, {"mel": mel.numpy()})[0]
-        preds    = logits.argmax(axis=1)
-        correct += (preds == labels.numpy()).sum()
-        total   += labels.shape[0]
+        for j in range(mel.shape[0]):
+            interp.set_tensor(inp_idx, mel[j : j + 1].numpy())
+            interp.invoke()
+            logits = interp.get_tensor(out_idx)[0]
+            correct += int(logits.argmax() == labels[j].item())
+            total += 1
     return correct / total
 
 
@@ -386,25 +341,17 @@ def main():
         "SmoothQuant/AWQ broke equivalence — check transformations"
     )
 
-    # ── Step 5: Export to ONNX ────────────────────────────────────────────────
-    print("\n[5/6] Exporting to ONNX (opset 17)...")
-    export_onnx(model_final, ONNX_SMOOTH_PATH)
-
-    # ── Step 6: Static INT8 quantization ─────────────────────────────────────
-    print("[6/6] Running ONNX Runtime static INT8 quantization...")
-    quant_dl = DataLoader(
-        calib_ds, batch_size=CALIB_BATCH_SZ, shuffle=False,
-        num_workers=0, collate_fn=collate_fn,
-    )
-    quantize_onnx_int8(ONNX_SMOOTH_PATH, ONNX_QUANT_PATH, quant_dl)
+    # ── Step 5: Export to TFLite INT8 ────────────────────────────────────────
+    print("\n[5/5] Exporting to TFLite INT8 (PT2E + litert-torch)...")
+    export_tflite(model_final, TFLITE_PATH)
 
     # ── Accuracy comparison ───────────────────────────────────────────────────
-    print("\nValidating final models (30 batches each)...")
-    acc_fp32 = eval_onnx(ONNX_SMOOTH_PATH, val_dl, n_batches=30)
-    acc_int8 = eval_onnx(ONNX_QUANT_PATH,  val_dl, n_batches=30)
-    print(f"  FP32 ONNX : {acc_fp32:.4f}")
-    print(f"  INT8 ONNX : {acc_int8:.4f}")
-    print(f"  Accuracy drop: {acc_fp32 - acc_int8:.4f}")
+    print("\nValidating final model (30 batches each)...")
+    acc_fp32   = eval_pytorch(model_final, val_dl, n_batches=30)
+    acc_tflite = eval_tflite(TFLITE_PATH, val_dl, n=30)
+    print(f"  FP32  (SQ+AWQ) : {acc_fp32:.4f}")
+    print(f"  INT8  TFLite   : {acc_tflite:.4f}")
+    print(f"  Accuracy drop  : {acc_fp32 - acc_tflite:.4f}")
 
     # ── Save preprocessing config ─────────────────────────────────────────────
     with open(CONFIG_PATH, "w") as f:
@@ -423,12 +370,11 @@ def main():
         )
 
     print(f"\nFiles ready for Raspberry Pi 3:")
-    print(f"  {ONNX_QUANT_PATH}")
+    print(f"  {TFLITE_PATH}")
     print(f"  {CONFIG_PATH}")
     print(
         "\nCopy both files to the Pi, then:\n"
-        "  python inference_rpi.py --model keyword_spotting_int8.onnx "
-        "--config preprocess_config.json --mode realtime"
+        "  python inference_rpi.py --mode realtime"
     )
 
 

@@ -1,14 +1,14 @@
 # Keyword Spotting on Raspberry Pi 3
 
-A decoder-only transformer trained to recognize 35 keywords from the Google Speech Commands v2 dataset, quantized to INT8 and deployed on a Raspberry Pi 3.
+A decoder-only transformer trained to recognize 35 keywords from the Google Speech Commands v2 dataset, quantized to INT8 TFLite and deployed on a Raspberry Pi 3.
 
 ## Overview
 
 The pipeline has three stages:
 
 1. **Train** — train a small transformer on the host machine (GPU recommended)
-2. **Quantize** — apply post-training quantization (AWQ, SmoothQuant, or both) and export to ONNX INT8
-3. **Infer** — run the INT8 ONNX model on the Raspberry Pi 3 from a microphone or audio file
+2. **Quantize** — apply post-training quantization (AWQ, SmoothQuant, or both) and export directly to TFLite INT8
+3. **Infer** — run the INT8 TFLite model on the Raspberry Pi 3 from a microphone or audio file
 
 ### Model Architecture
 
@@ -22,11 +22,11 @@ The pipeline has three stages:
 
 | Script | Method | Output model |
 |---|---|---|
-| `quantize_awq.py` | AWQ only | `keyword_spotting_awq_int8.onnx` |
-| `quantize_smoothquant.py` | SmoothQuant only | `keyword_spotting_smoothquant_int8.onnx` |
-| `quantize.py` | SmoothQuant + AWQ combined | `keyword_spotting_int8.onnx` |
+| `quantize_awq.py` | AWQ only | `keyword_spotting_awq.tflite` |
+| `quantize_smoothquant.py` | SmoothQuant only | `keyword_spotting_smoothquant.tflite` |
+| `quantize.py` | SmoothQuant + AWQ combined | `keyword_spotting_combined.tflite` |
 
-All three export to ONNX opset 17 and apply ONNX Runtime static INT8 quantization (QDQ format, per-channel weights, `reduce_range=True` for ARM NEON compatibility).
+All three use `litert-torch` (PT2E static INT8 quantization with per-channel weights) to convert the transformed PyTorch model directly to TFLite — no ONNX step.
 
 ---
 
@@ -38,13 +38,11 @@ All three export to ONNX opset 17 and apply ONNX Runtime static INT8 quantizatio
 pip install -r requirements_training.txt
 ```
 
-### Raspberry Pi 3 (64-bit OS)
+### Raspberry Pi 3
 
 ```bash
 pip install -r requirements_rpi.txt
 ```
-
-> **Note:** `onnxruntime >= 1.18` ships official `aarch64` wheels. On a 32-bit OS use `onnxruntime-rpi` (community build) or build from source.
 
 ---
 
@@ -79,14 +77,16 @@ Each script:
 1. Loads `checkpoints/best_model.pt`
 2. Calibrates activation statistics on the validation set
 3. Applies weight transformations (lossless, folded into LayerNorm)
-4. Exports to ONNX and runs ONNX Runtime static INT8 quantization
-5. Prints FP32 vs INT8 accuracy comparison
+4. Exports directly to TFLite INT8 via PT2E quantization (no ONNX step)
+5. Prints FP32 vs INT8 TFLite accuracy comparison
 6. Saves `checkpoints/preprocess_config.json`
 
 ### 3. Evaluate (on training machine)
 
 ```bash
-python evaluate.py --model checkpoints/keyword_spotting_awq_int8.onnx
+python evaluate.py --model checkpoints/keyword_spotting_awq.tflite
+python evaluate.py --model checkpoints/keyword_spotting_smoothquant.tflite
+python evaluate.py --model checkpoints/keyword_spotting_combined.tflite
 ```
 
 ### 4. Deploy to Raspberry Pi 3
@@ -94,8 +94,8 @@ python evaluate.py --model checkpoints/keyword_spotting_awq_int8.onnx
 Copy the two output files to the Pi:
 
 ```bash
-scp checkpoints/keyword_spotting_awq_int8.onnx pi@<pi-ip>:~/keyword_spotting/
-scp checkpoints/preprocess_config.json          pi@<pi-ip>:~/keyword_spotting/
+scp checkpoints/keyword_spotting_awq.tflite pi@<pi-ip>:~/keyword_spotting/
+scp checkpoints/preprocess_config.json      pi@<pi-ip>:~/keyword_spotting/
 ```
 
 ### 5. Run inference on Raspberry Pi 3
@@ -111,13 +111,13 @@ python inference_rpi_awq.py --mode file --file clip.wav
 python inference_rpi_awq.py --mode benchmark
 ```
 
-For SmoothQuant or combined models replace `inference_rpi_awq.py` with `inference_rpi_smoothquant.py` or `inference_rpi.py` respectively, and point `--model` at the corresponding `.onnx` file.
+For SmoothQuant or combined models replace `inference_rpi_awq.py` with `inference_rpi_smoothquant.py` or `inference_rpi.py` respectively.
 
 **Options:**
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model` | `keyword_spotting_awq_int8.onnx` | Path to ONNX model |
+| `--model` | `keyword_spotting_awq.tflite` | Path to TFLite model |
 | `--config` | `preprocess_config.json` | Path to preprocessing config |
 | `--mode` | `realtime` | `realtime` / `file` / `benchmark` |
 | `--file` | — | Audio file path (mode=file only) |
@@ -129,10 +129,10 @@ For SmoothQuant or combined models replace `inference_rpi_awq.py` with `inferenc
 
 ```
 ├── train.py                        # Model definition + training
-├── quantize_awq.py                 # AWQ-only quantization pipeline
-├── quantize_smoothquant.py         # SmoothQuant-only quantization pipeline
-├── quantize.py                     # SmoothQuant + AWQ combined pipeline
-├── evaluate.py                     # Evaluate quantized ONNX model on validation set
+├── quantize_awq.py                 # AWQ-only quantization → TFLite
+├── quantize_smoothquant.py         # SmoothQuant-only quantization → TFLite
+├── quantize.py                     # SmoothQuant + AWQ combined → TFLite
+├── evaluate.py                     # Evaluate TFLite model on validation set
 ├── inference_rpi_awq.py            # Pi inference script for AWQ model
 ├── inference_rpi_smoothquant.py    # Pi inference script for SmoothQuant model
 ├── inference_rpi.py                # Pi inference script for combined model
@@ -140,7 +140,9 @@ For SmoothQuant or combined models replace `inference_rpi_awq.py` with `inferenc
 ├── requirements_rpi.txt            # Dependencies for Raspberry Pi
 └── checkpoints/                    # Saved models (generated)
     ├── best_model.pt
-    ├── keyword_spotting_awq_int8.onnx
+    ├── keyword_spotting_awq.tflite
+    ├── keyword_spotting_smoothquant.tflite
+    ├── keyword_spotting_combined.tflite
     └── preprocess_config.json
 ```
 

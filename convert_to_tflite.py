@@ -24,8 +24,8 @@ import torch
 from torch.utils.data import DataLoader
 
 import onnx
+import onnx2tf
 import onnxsim
-from onnx_tf.backend import prepare
 import tensorflow as tf
 
 from train import (
@@ -93,11 +93,18 @@ def _simplify_onnx(model: onnx.ModelProto) -> onnx.ModelProto:
 
 
 def _onnx_to_saved_model(onnx_path: str, saved_model_dir: str):
-    """ONNX FP32 → TensorFlow SavedModel via onnx-tf."""
+    """ONNX FP32 → TensorFlow SavedModel via onnx2tf."""
     model = onnx.load(onnx_path)
     model = _simplify_onnx(model)
-    tf_rep = prepare(model)
-    tf_rep.export_graph(saved_model_dir)
+    with tempfile.TemporaryDirectory() as tmp:
+        simplified_path = os.path.join(tmp, "model.onnx")
+        onnx.save(model, simplified_path)
+        onnx2tf.convert(
+            input_onnx_file_path=simplified_path,
+            output_folder_path=saved_model_dir,
+            not_use_onnxsim=True,
+            non_verbose=True,
+        )
 
 
 def _saved_model_to_tflite(
