@@ -1,8 +1,8 @@
 """
-Keyword spotting inference for Raspberry Pi 3 — AWQ INT8 model.
+Keyword spotting inference for Raspberry Pi 3 — AWQ TFLite model.
 
 Copy these files from your training machine:
-    keyword_spotting_awq_int8.onnx
+    keyword_spotting_awq.tflite
     preprocess_config.json
 
 Install on the Pi:
@@ -12,14 +12,6 @@ Usage:
     python inference_rpi_awq.py --mode realtime
     python inference_rpi_awq.py --mode file --file clip.wav
     python inference_rpi_awq.py --mode benchmark
-
-AWQ note:
-    The weights in this model have been scaled channel-wise to protect
-    "salient" channels — those that receive large activations and therefore
-    have the most impact on the output.  The optimal per-channel scale was
-    found by grid-searching for the alpha that minimises simulated INT8
-    weight error.  This typically gives the best accuracy among INT8
-    approaches for transformer models.
 """
 
 import argparse
@@ -28,7 +20,7 @@ import os
 import time
 
 import numpy as np
-import onnxruntime as ort
+import tflite_runtime.interpreter as tflite
 
 try:
     import sounddevice as sd
@@ -48,11 +40,8 @@ try:
 except ImportError:
     _HAS_SF = False
 
-
-# ── Default paths ─────────────────────────────────────────────────────────────
-
-DEFAULT_MODEL  = "checkpoints/keyword_spotting_awq_int8.onnx"
-DEFAULT_CONFIG = "checkpoints/preprocess_config.json"
+DEFAULT_MODEL  = "keyword_spotting_awq.tflite"
+DEFAULT_CONFIG = "preprocess_config.json"
 
 
 # ── Mel spectrogram ───────────────────────────────────────────────────────────
@@ -63,7 +52,6 @@ def _mel_filterbank(sr: int, n_fft: int, n_mels: int) -> np.ndarray:
     pts_mel = np.linspace(lo_mel, hi_mel, n_mels + 2)
     pts_hz  = 700.0 * (10.0 ** (pts_mel / 2595.0) - 1.0)
     bins    = np.floor((n_fft + 1) * pts_hz / sr).astype(int)
-
     fb = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float32)
     for m in range(1, n_mels + 1):
         lo, mid, hi = bins[m - 1], bins[m], bins[m + 1]
@@ -91,19 +79,13 @@ def _stft_numpy(wave: np.ndarray, n_fft: int, hop: int, win_len: int) -> np.ndar
 
 
 def compute_log_mel(wave: np.ndarray, cfg: dict) -> np.ndarray:
-    """
-    Compute normalised log-mel spectrogram matching the training transform.
-    Returns [max_frames, n_mels] float32.
-    """
     sr, n_fft = cfg["sample_rate"], cfg["n_fft"]
-    hop, win  = cfg["hop_length"],  cfg["win_length"]
-    n_mels    = cfg["n_mels"]
-    max_f     = cfg["max_frames"]
+    hop, win  = cfg["hop_length"], cfg["win_length"]
+    n_mels, max_f = cfg["n_mels"], cfg["max_frames"]
 
     if _HAS_LIBROSA:
         mel     = librosa.feature.melspectrogram(
-            y=wave, sr=sr, n_fft=n_fft, hop_length=hop,
-            win_length=win, n_mels=n_mels,
+            y=wave, sr=sr, n_fft=n_fft, hop_length=hop, win_length=win, n_mels=n_mels,
         )
         log_mel = np.log(mel + 1e-6).T
     else:
@@ -113,9 +95,7 @@ def compute_log_mel(wave: np.ndarray, cfg: dict) -> np.ndarray:
 
     T = log_mel.shape[0]
     if T < max_f:
-        log_mel = np.vstack(
-            [log_mel, np.zeros((max_f - T, n_mels), dtype=np.float32)]
-        )
+        log_mel = np.vstack([log_mel, np.zeros((max_f - T, n_mels), dtype=np.float32)])
     else:
         log_mel = log_mel[:max_f]
 
@@ -123,7 +103,7 @@ def compute_log_mel(wave: np.ndarray, cfg: dict) -> np.ndarray:
     return log_mel.astype(np.float32)
 
 
-# ── Audio file loading ────────────────────────────────────────────────────────
+# ── Audio loading ─────────────────────────────────────────────────────────────
 
 def _resample(wave: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     if orig_sr == target_sr:
@@ -146,7 +126,6 @@ def load_audio(path: str, target_sr: int) -> np.ndarray:
         wave = wave.astype(np.float32)
         if wave.max() > 1.5:
             wave /= 32768.0
-
     wave = _resample(wave, sr, target_sr)
     n = target_sr
     if len(wave) < n:
@@ -154,58 +133,45 @@ def load_audio(path: str, target_sr: int) -> np.ndarray:
     return wave[:n]
 
 
-# ── ONNX inference engine ─────────────────────────────────────────────────────
+# ── TFLite inference engine ───────────────────────────────────────────────────
 
 class AWQSpotter:
-    """
-    Keyword spotter using an AWQ INT8 ONNX model.
-
-    AWQ found per-channel weight scales that minimise the quantisation error
-    on salient (high-activation) channels.  The scales were folded into the
-    adjacent LayerNorm parameters before export, so this model has the same
-    graph structure as the unquantised model — only the weight values differ.
-    """
+    """Keyword spotter using the AWQ TFLite INT8 model."""
 
     def __init__(self, model_path: str, config_path: str):
         with open(config_path) as f:
             self.cfg = json.load(f)
         self.keywords = self.cfg["keywords"]
 
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads     = 4   # RPi3 is quad-core
-        opts.inter_op_num_threads     = 1
-        opts.execution_mode           = ort.ExecutionMode.ORT_SEQUENTIAL
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opts.enable_mem_pattern       = True
-        opts.enable_cpu_mem_arena     = True
-
-        self.sess = ort.InferenceSession(
-            model_path, opts, providers=["CPUExecutionProvider"]
+        self.interpreter = tflite.Interpreter(
+            model_path=model_path,
+            num_threads=4,
         )
+        self.interpreter.allocate_tensors()
+        self._inp_idx = self.interpreter.get_input_details()[0]["index"]
+        self._out_idx = self.interpreter.get_output_details()[0]["index"]
+
+        inp_shape = self.interpreter.get_input_details()[0]["shape"]
         print(f"[AWQ] Loaded: {model_path}")
+        print(f"  Input shape : {inp_shape}")
         print(f"  Classes ({len(self.keywords)}): {', '.join(self.keywords)}")
 
-    def predict(self, wave: np.ndarray) -> tuple[str, float, float]:
-        """
-        Parameters
-        ----------
-        wave : mono float32 at cfg["sample_rate"]
-
-        Returns
-        -------
-        (keyword, confidence, latency_ms)
-        """
+    def predict(self, wave: np.ndarray) -> tuple:
         t0      = time.perf_counter()
         log_mel = compute_log_mel(wave, self.cfg)
-        inp     = log_mel[np.newaxis]                       # [1, T, n_mels]
-        logits  = self.sess.run(None, {"mel": inp})[0][0]  # [n_classes]
-        e       = np.exp(logits - logits.max())
-        probs   = e / e.sum()
-        idx     = int(probs.argmax())
-        lat     = (time.perf_counter() - t0) * 1_000.0
+        inp     = log_mel[np.newaxis].astype(np.float32)
+
+        self.interpreter.set_tensor(self._inp_idx, inp)
+        self.interpreter.invoke()
+        logits = self.interpreter.get_tensor(self._out_idx)[0]
+
+        e     = np.exp(logits - logits.max())
+        probs = e / e.sum()
+        idx   = int(probs.argmax())
+        lat   = (time.perf_counter() - t0) * 1_000.0
         return self.keywords[idx], float(probs[idx]), lat
 
-    def predict_file(self, path: str) -> tuple[str, float, float]:
+    def predict_file(self, path: str) -> tuple:
         wave = load_audio(path, self.cfg["sample_rate"])
         return self.predict(wave)
 
@@ -223,8 +189,7 @@ def run_realtime(spotter: AWQSpotter, threshold: float):
         while True:
             audio = sd.rec(sr, samplerate=sr, channels=1, dtype="float32")
             sd.wait()
-            wave = audio.flatten()
-            kw, conf, lat = spotter.predict(wave)
+            kw, conf, lat = spotter.predict(audio.flatten())
             bar = "█" * int(conf * 20)
             tag = ">>> DETECTED" if conf >= threshold else "    silence "
             print(f"{tag}  {kw:<12s}  {conf:5.1%}  |{bar:<20s}|  {lat:5.1f} ms")
@@ -237,32 +202,27 @@ def run_file(spotter: AWQSpotter, path: str):
         print(f"File not found: {path}")
         return
     kw, conf, lat = spotter.predict_file(path)
-    print(f"[AWQ]")
-    print(f"  File      : {path}")
+    print(f"[AWQ]  {path}")
     print(f"  Predicted : {kw}  ({conf:.2%})  in {lat:.1f} ms")
 
 
 def run_benchmark(spotter: AWQSpotter, n_runs: int = 100):
-    sr      = spotter.cfg["sample_rate"]
-    silence = np.zeros(sr, dtype=np.float32)
-    for _ in range(10):                        # warmup
+    silence = np.zeros(spotter.cfg["sample_rate"], dtype=np.float32)
+    for _ in range(10):
         spotter.predict(silence)
-    lats = [spotter.predict(silence)[2] for _ in range(n_runs)]
-    a    = np.array(lats)
-    print(f"\n[AWQ] Benchmark on {n_runs} silent clips:")
-    print(f"  Mean   : {a.mean():.1f} ms")
-    print(f"  Median : {np.median(a):.1f} ms")
-    print(f"  P95    : {np.percentile(a, 95):.1f} ms")
-    print(f"  P99    : {np.percentile(a, 99):.1f} ms")
-    print(f"  Min    : {a.min():.1f} ms  |  Max: {a.max():.1f} ms")
+    lats = np.array([spotter.predict(silence)[2] for _ in range(n_runs)])
+    print(f"\n[AWQ] Benchmark ({n_runs} runs):")
+    print(f"  Mean   : {lats.mean():.1f} ms")
+    print(f"  Median : {np.median(lats):.1f} ms")
+    print(f"  P95    : {np.percentile(lats, 95):.1f} ms")
+    print(f"  P99    : {np.percentile(lats, 99):.1f} ms")
+    print(f"  Min    : {lats.min():.1f} ms  |  Max: {lats.max():.1f} ms")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser(
-        description="Keyword spotting — AWQ INT8 — Raspberry Pi 3"
-    )
+    p = argparse.ArgumentParser(description="Keyword spotting — AWQ TFLite — RPi3")
     p.add_argument("--model",     default=DEFAULT_MODEL)
     p.add_argument("--config",    default=DEFAULT_CONFIG)
     p.add_argument("--mode",      default="realtime",
@@ -271,22 +231,16 @@ def main():
     p.add_argument("--threshold", type=float, default=0.70)
     args = p.parse_args()
 
-    for fpath in (args.model, args.config):
-        if not os.path.isfile(fpath):
-            raise FileNotFoundError(
-                f"Not found: {fpath}\n"
-                "Copy the model and config from the training machine."
-            )
+    for f in (args.model, args.config):
+        if not os.path.isfile(f):
+            raise FileNotFoundError(f"Not found: {f}\nCopy from training machine.")
 
     spotter = AWQSpotter(args.model, args.config)
 
     if args.mode == "benchmark":
         run_benchmark(spotter)
     elif args.mode == "file":
-        if args.file is None:
-            print("Provide --file <path>")
-        else:
-            run_file(spotter, args.file)
+        run_file(spotter, args.file) if args.file else print("Provide --file <path>")
     else:
         run_realtime(spotter, args.threshold)
 
