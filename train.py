@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchaudio.datasets import SPEECHCOMMANDS
 from torchaudio.transforms import MelSpectrogram, FrequencyMasking, TimeMasking
 from pathlib import Path
+from tqdm import tqdm
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -29,7 +30,7 @@ N_LAYERS     = 4
 D_FF         = 512
 DROPOUT      = 0.1
 
-BATCH_SIZE   = 64
+BATCH_SIZE   = 256
 LR           = 3e-4
 WEIGHT_DECAY = 1e-4
 EPOCHS       = 40
@@ -62,7 +63,8 @@ class SpeechCommandsDataset(Dataset):
         self.freq_mask = FrequencyMasking(freq_mask_param=10)
         self.time_mask = TimeMasking(time_mask_param=20)
         self._indices = [
-            i for i in range(len(self._ds)) if self._ds[i][2] in LABEL2IDX
+            i for i, path in enumerate(self._ds._walker)
+            if Path(path).parent.name in LABEL2IDX
         ]
 
     def __len__(self) -> int:
@@ -118,7 +120,7 @@ class CausalSelfAttention(nn.Module):
 
         attn = (q @ k.transpose(-2, -1)) / self.scale   # [B, H, T, T]
         causal = torch.triu(
-            torch.full((T, T), float("-inf"), device=x.device), diagonal=1
+            torch.full((T, T), -1e4, device=x.device), diagonal=1
         )
         attn = attn + causal
         attn = F.softmax(attn, dim=-1)
@@ -221,6 +223,7 @@ class KeywordSpottingTransformer(nn.Module):
 
 def train():
     os.makedirs(CKPT_DIR, exist_ok=True)
+    os.makedirs(DATA_ROOT, exist_ok=True)
 
     print("Loading datasets (downloads ~2.4 GB on first run)...")
     train_ds = SpeechCommandsDataset(DATA_ROOT, "training",   augment=True)
@@ -228,9 +231,9 @@ def train():
     print(f"  Train: {len(train_ds):,}  |  Val: {len(val_ds):,}")
 
     train_dl = DataLoader(train_ds, BATCH_SIZE, shuffle=True,
-                          num_workers=4, collate_fn=collate_fn, pin_memory=True)
+                          num_workers=2, collate_fn=collate_fn, pin_memory=True)
     val_dl   = DataLoader(val_ds, BATCH_SIZE, shuffle=False,
-                          num_workers=4, collate_fn=collate_fn, pin_memory=True)
+                          num_workers=2, collate_fn=collate_fn, pin_memory=True)
 
     model = KeywordSpottingTransformer().to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
@@ -249,7 +252,8 @@ def train():
     for epoch in range(1, EPOCHS + 1):
         model.train()
         total_loss = total_correct = total = 0
-        for mel, labels in train_dl:
+        train_bar = tqdm(train_dl, desc=f"Epoch {epoch:3d}/{EPOCHS} [train]", leave=False)
+        for mel, labels in train_bar:
             mel, labels = mel.to(DEVICE), labels.to(DEVICE)
             logits = model(mel)
             loss   = criterion(logits, labels)
@@ -261,17 +265,20 @@ def train():
             total_loss    += loss.item() * labels.size(0)
             total_correct += (logits.argmax(1) == labels).sum().item()
             total         += labels.size(0)
+            train_bar.set_postfix(loss=f"{total_loss/total:.4f}", acc=f"{total_correct/total:.4f}")
 
         train_acc = total_correct / total
 
         model.eval()
         val_correct = val_total = 0
         with torch.no_grad():
-            for mel, labels in val_dl:
+            val_bar = tqdm(val_dl, desc=f"Epoch {epoch:3d}/{EPOCHS} [val]  ", leave=False)
+            for mel, labels in val_bar:
                 mel, labels = mel.to(DEVICE), labels.to(DEVICE)
                 preds        = model(mel).argmax(1)
                 val_correct += (preds == labels).sum().item()
                 val_total   += labels.size(0)
+                val_bar.set_postfix(acc=f"{val_correct/val_total:.4f}")
         val_acc = val_correct / val_total
 
         print(

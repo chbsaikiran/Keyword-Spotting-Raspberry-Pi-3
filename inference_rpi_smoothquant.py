@@ -31,7 +31,7 @@ import onnxruntime as ort
 try:
     import sounddevice as sd
     _HAS_SD = True
-except ImportError:
+except (ImportError, OSError):
     _HAS_SD = False
 
 try:
@@ -49,8 +49,8 @@ except ImportError:
 
 # ── Default paths ─────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL  = "keyword_spotting_smoothquant_int8.onnx"
-DEFAULT_CONFIG = "preprocess_config.json"
+DEFAULT_MODEL  = "checkpoints/keyword_spotting_smoothquant_int8.onnx"
+DEFAULT_CONFIG = "checkpoints/preprocess_config.json"
 
 
 # ── Mel spectrogram ───────────────────────────────────────────────────────────

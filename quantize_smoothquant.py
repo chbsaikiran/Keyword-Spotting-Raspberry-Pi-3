@@ -231,6 +231,7 @@ def quantize_onnx(fp32_path: str, int8_path: str, dataloader: DataLoader):
         weight_type=QuantType.QInt8,
         per_channel=True,
         reduce_range=True,
+        op_types_to_quantize=["MatMul", "Gemm"],
         extra_options={
             "ActivationSymmetric": True,
             "WeightSymmetric": True,

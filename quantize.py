@@ -294,6 +294,7 @@ def quantize_onnx_int8(raw_path: str, quant_path: str, dataloader: DataLoader):
         per_channel=True,
         # reduce_range avoids INT8 overflow on ARM NEON accumulators (RPi3)
         reduce_range=True,
+        op_types_to_quantize=["MatMul", "Gemm"],
         extra_options={
             "ActivationSymmetric": True,
             "WeightSymmetric": True,
