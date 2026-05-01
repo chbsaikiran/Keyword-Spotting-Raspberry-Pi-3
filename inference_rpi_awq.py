@@ -174,56 +174,24 @@ class AWQSpotter:
         except AttributeError:
             pass
 
-        # ── Probe invoke: discover weight tensors that the C++ runtime        ──
-        # ── requires but tflite_runtime doesn't surface via                  ──
-        # ── get_input_details().  For each one we force-allocate it with     ──
-        # ── resize_tensor_input(), then set its saved INT8 data from config. ──
+        # ── Probe invoke with a dummy mel input to verify the model is clean. ──
         dummy = np.zeros([1, max_frames, n_mels], dtype=np.float32)
-        for _attempt in range(20):
-            self.interpreter.set_tensor(self._inp_idx, dummy)
-            for idx, data in self._extra_inputs:
-                self.interpreter.set_tensor(idx, data)
-            try:
-                self.interpreter.invoke()
-                break
-            except RuntimeError as exc:
-                m = re.search(r'Input tensor (\d+) lacks data', str(exc))
-                if not m:
-                    raise
-                missing = int(m.group(1))
-                td = td_by_idx.get(missing)
-                if td is None:
-                    raise RuntimeError(
-                        f"Input tensor {missing} lacks data and is not in "
-                        f"get_tensor_details(). Re-run quantize_awq.py."
-                    ) from exc
-                shape = [int(x) for x in td["shape"]]
-                dtype = td["dtype"]
-                weight = self._load_hidden_weight(missing, shape, dtype)
-
-                # Force-allocate by trying each input position (position 0 is
-                # the mel input; hidden weights are at positions 1, 2, ...).
-                allocated = False
-                for pos in range(1, 10):
-                    try:
-                        self.interpreter.resize_tensor_input(pos, shape)
-                        self.interpreter.allocate_tensors()
-                        self.interpreter.set_tensor(missing, weight)
-                        allocated = True
-                        self._extra_inputs.append((missing, weight))
-                        print(f"  [AWQ] Allocated hidden weight: idx={missing} "
-                              f"shape={shape} dtype={dtype.__name__} "
-                              f"at input pos {pos}")
-                        break
-                    except Exception:
-                        continue
-                if not allocated:
-                    raise RuntimeError(
-                        f"Input tensor {missing} (shape={shape}) cannot be "
-                        f"force-allocated.\nRe-run quantize_awq.py on the "
-                        f"training machine, copy checkpoints/ to the Pi, "
-                        f"then retry."
-                    ) from exc
+        self.interpreter.set_tensor(self._inp_idx, dummy)
+        for idx, data in self._extra_inputs:
+            self.interpreter.set_tensor(idx, data)
+        try:
+            self.interpreter.invoke()
+        except RuntimeError as exc:
+            m = re.search(r'Input tensor (\d+) lacks data', str(exc))
+            if m:
+                raise RuntimeError(
+                    f"\nInput tensor {m.group(1)} lacks data.\n"
+                    f"The .tflite was built with an old quantize_awq.py that "
+                    f"left weight tensors in the subgraph inputs list.\n"
+                    f"Fix: re-run  python quantize_awq.py  on the training "
+                    f"machine, copy checkpoints/ to the Pi, then retry."
+                ) from exc
+            raise
 
         print(f"[AWQ] Loaded: {model_path}")
         print(f"  Input shape  : {mel_shape}")
@@ -237,15 +205,6 @@ class AWQSpotter:
             flat = np.array(self.cfg["cls_token"], dtype=np.float32).flatten()
             if flat.size == n:
                 return flat.reshape(shape).astype(dtype)
-        return np.zeros(shape, dtype=dtype)
-
-    def _load_hidden_weight(self, tensor_idx: int, shape: list, dtype) -> np.ndarray:
-        """Return saved INT8 weight data from config, or zeros as fallback."""
-        hw = self.cfg.get("hidden_weights", {}).get(str(tensor_idx))
-        if hw is not None:
-            return np.array(hw["data"], dtype=dtype).reshape(shape)
-        print(f"  [AWQ] Warning: no saved data for tensor {tensor_idx} in config "
-              f"— using zeros (re-run quantize_awq.py for correct weights).")
         return np.zeros(shape, dtype=dtype)
 
     def predict(self, wave: np.ndarray) -> tuple:

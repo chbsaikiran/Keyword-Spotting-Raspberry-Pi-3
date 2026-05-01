@@ -22,7 +22,9 @@ Output files (copy both to Raspberry Pi):
 import copy
 import json
 import os
+import struct
 
+import numpy as np
 import torch
 import torch.nn as nn
 import litert_torch as ltt
@@ -240,57 +242,74 @@ def apply_awq_scales(
 
 # ── TFLite export ─────────────────────────────────────────────────────────────
 
-def _extract_hidden_weights(tflite_path: str) -> dict:
+def _fix_hidden_inputs(int8_bytes: bytes) -> bytes:
     """
-    Find weight tensors that litert-torch/PT2E leaves in the flatbuffer's
-    subgraph inputs list and save their INT8 data so the Pi can provide them.
+    Remove weight tensors from the subgraph inputs list via a targeted
+    in-place binary patch.
 
-    Newer tf.lite auto-initialises these from the embedded buffer; older
-    tflite_runtime on RPi raises 'Input tensor N lacks data' and needs them
-    supplied via set_tensor().  We detect them by comparing the raw flatbuffer
-    inputs list (read via schema_py_generated) with the Python API's filtered
-    get_input_details(), then extract their data with tf.lite.Interpreter.
+    litert-torch / PT2E lifts model parameters as graph inputs.
+    ai_edge_quantizer quantises them to INT8 constants but keeps them in the
+    subgraph inputs list.  Newer tf.lite auto-initialises these from the
+    embedded flatbuffer buffer; older tflite_runtime on RPi 3 requires every
+    declared input to be supplied via set_tensor() and raises
+    'Input tensor N lacks data' without them.
+
+    We patch only the 4-byte count field of the inputs vector — no
+    re-serialisation, no buffer data touched.  The weight tensors remain as
+    embedded constants; they just stop being declared as external inputs.
     """
     try:
         from tensorflow.lite.python import schema_py_generated as schema_fb
     except ImportError:
-        print("  [Warning] schema_py_generated unavailable; "
-              "hidden_weights will not be saved — Pi may fail.")
-        return {}
+        print("  [Warning] schema_py_generated unavailable — "
+              "skipping hidden-input patch (Pi may raise 'lacks data').")
+        return int8_bytes
 
-    with open(tflite_path, "rb") as fh:
-        raw = bytearray(fh.read())
-    raw_model  = schema_fb.ModelT.InitFromPackedBuf(raw, 0)
-    raw_inputs = set(raw_model.subgraphs[0].inputs)   # full C++ level list
+    raw_model  = schema_fb.ModelT.InitFromPackedBuf(bytearray(int8_bytes), 0)
+    raw_inputs = list(raw_model.subgraphs[0].inputs)   # full flatbuffer list
 
-    interp = tf.lite.Interpreter(model_path=tflite_path)
+    interp = tf.lite.Interpreter(model_content=bytes(int8_bytes))
     interp.allocate_tensors()
     py_inputs = {d["index"] for d in interp.get_input_details()}
 
-    hidden = sorted(raw_inputs - py_inputs)
+    hidden = [idx for idx in raw_inputs if idx not in py_inputs]
     if not hidden:
-        return {}
+        print("  No hidden inputs found — model is already clean.")
+        return int8_bytes
 
-    print(f"  Found {len(hidden)} hidden weight input(s) not visible to "
-          f"tflite_runtime: {hidden}")
-    saved: dict = {}
-    for idx in hidden:
-        try:
-            data = interp.get_tensor(idx)
-        except Exception:
-            # Try after a dummy invoke in case the tensor needs activation
-            mel_idx = interp.get_input_details()[0]["index"]
-            interp.set_tensor(mel_idx,
-                              np.zeros([1, MAX_FRAMES, N_MELS], dtype=np.float32))
-            interp.invoke()
-            data = interp.get_tensor(idx)
-        saved[str(idx)] = {
-            "data":  data.flatten().tolist(),
-            "shape": list(data.shape),
-            "dtype": np.dtype(data.dtype).str,
-        }
-        print(f"    Saved tensor {idx}: shape={data.shape} dtype={data.dtype}")
-    return saved
+    print(f"  Hidden weight tensor(s) in inputs list: {hidden}")
+
+    # Build the exact byte pattern for the inputs vector as it sits in the
+    # flatbuffer: [uint32 count][int32 tensor_0][int32 tensor_1]...
+    # raw_inputs order matches the flatbuffer storage order.
+    pattern = struct.pack("<I", len(raw_inputs))
+    for idx in raw_inputs:
+        pattern += struct.pack("<i", idx)
+
+    buf     = bytearray(int8_bytes)
+    found   = []
+
+    # Flatbuffers aligns all table data to 4 bytes — search on that boundary.
+    for i in range(0, len(buf) - len(pattern) + 1, 4):
+        if buf[i : i + len(pattern)] == pattern:
+            found.append(i)
+
+    # Fallback: byte-by-byte in case alignment differs.
+    if not found:
+        for i in range(len(buf) - len(pattern) + 1):
+            if buf[i : i + len(pattern)] == pattern:
+                found.append(i)
+
+    if len(found) == 1:
+        struct.pack_into("<I", buf, found[0], 1)   # set count = 1 (mel only)
+        print(f"  Patched subgraph inputs: removed {len(hidden)} "
+              f"weight tensor(s) {hidden} — kept only mel tensor.")
+        return bytes(buf)
+
+    print(f"  [Warning] Expected 1 match for inputs-vector pattern, "
+          f"found {len(found)}.  Model left unpatched — Pi will likely "
+          f"fail with 'Input tensor N lacks data'.")
+    return int8_bytes
 
 
 def export_tflite(model: nn.Module, tflite_path: str):
@@ -307,7 +326,7 @@ def export_tflite(model: nn.Module, tflite_path: str):
         num_bits=8,
         granularity=aq.qtyping.QuantGranularity.CHANNELWISE,
     )
-    int8_bytes = qt.quantize().quantized_model
+    int8_bytes = _fix_hidden_inputs(bytes(qt.quantize().quantized_model))
 
     os.makedirs(os.path.dirname(os.path.abspath(tflite_path)), exist_ok=True)
     with open(tflite_path, "wb") as f:
@@ -404,9 +423,6 @@ def main():
     print(f"  Accuracy drop: {acc_fp32 - acc_tflite:.4f}")
 
     # ── Save preprocessing config ─────────────────────────────────────────────
-    print("\nExtracting hidden weight tensors for RPi compatibility...")
-    hidden_weights = _extract_hidden_weights(TFLITE_PATH)
-
     with open(CONFIG_PATH, "w") as f:
         json.dump(
             {
@@ -415,9 +431,6 @@ def main():
                 "n_mels": N_MELS,           "max_frames": MAX_FRAMES,
                 "keywords": KEYWORDS,
                 "cls_token": model_awq.cls_token.detach().numpy().tolist(),
-                # Weight tensors that litert-torch leaves in the subgraph inputs
-                # list; older tflite_runtime requires them via set_tensor().
-                "hidden_weights": hidden_weights,
             },
             f, indent=2,
         )
