@@ -40,8 +40,8 @@ try:
 except ImportError:
     _HAS_SF = False
 
-DEFAULT_MODEL  = "keyword_spotting_awq.tflite"
-DEFAULT_CONFIG = "preprocess_config.json"
+DEFAULT_MODEL  = "checkpoints/keyword_spotting_awq.tflite"
+DEFAULT_CONFIG = "checkpoints/preprocess_config.json"
 
 
 # ── Mel spectrogram ───────────────────────────────────────────────────────────
@@ -148,8 +148,35 @@ class AWQSpotter:
             num_threads=4,
         )
         self.interpreter.allocate_tensors()
-        self._inp_idx = self.interpreter.get_input_details()[0]["index"]
+
+        n_mels     = self.cfg["n_mels"]
+        max_frames = self.cfg["max_frames"]
+        input_details = self.interpreter.get_input_details()
         self._out_idx = self.interpreter.get_output_details()[0]["index"]
+
+        self._inp_idx      = None
+        self._extra_inputs = []  # [(tensor_index, numpy_data), ...]
+
+        for det in input_details:
+            shape = list(det["shape"])
+            if shape == [1, max_frames, n_mels]:
+                self._inp_idx = det["index"]
+            else:
+                # Extra input — typically the learnable cls_token parameter
+                # exported as a graph input by PT2E/litert-torch.
+                if "cls_token" in self.cfg:
+                    data = np.array(self.cfg["cls_token"], dtype=np.float32)
+                else:
+                    data = np.zeros(shape, dtype=np.float32)
+                    print(
+                        f"[AWQ] Warning: extra input (idx={det['index']}, shape={shape}) "
+                        f"not in config — feeding zeros. Re-run quantize_awq.py on the "
+                        f"training machine to embed the trained cls_token value."
+                    )
+                self._extra_inputs.append((det["index"], data))
+
+        if self._inp_idx is None:
+            self._inp_idx = input_details[0]["index"]
 
         inp_shape = self.interpreter.get_input_details()[0]["shape"]
         print(f"[AWQ] Loaded: {model_path}")
@@ -162,6 +189,8 @@ class AWQSpotter:
         inp     = log_mel[np.newaxis].astype(np.float32)
 
         self.interpreter.set_tensor(self._inp_idx, inp)
+        for idx, data in self._extra_inputs:
+            self.interpreter.set_tensor(idx, data)
         self.interpreter.invoke()
         logits = self.interpreter.get_tensor(self._out_idx)[0]
 

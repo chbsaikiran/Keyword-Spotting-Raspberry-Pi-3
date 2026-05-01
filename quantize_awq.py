@@ -358,6 +358,9 @@ def main():
                 "win_length": WIN_LENGTH,   "hop_length": HOP_LENGTH,
                 "n_mels": N_MELS,           "max_frames": MAX_FRAMES,
                 "keywords": KEYWORDS,
+                # cls_token is exported as a separate TFLite input by PT2E/litert-torch;
+                # the inference script reads this to feed the correct trained value.
+                "cls_token": model_awq.cls_token.detach().numpy().tolist(),
             },
             f, indent=2,
         )

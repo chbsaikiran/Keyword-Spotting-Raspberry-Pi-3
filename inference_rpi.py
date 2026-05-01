@@ -40,8 +40,8 @@ try:
 except ImportError:
     _HAS_SF = False
 
-DEFAULT_MODEL  = "keyword_spotting_combined.tflite"
-DEFAULT_CONFIG = "preprocess_config.json"
+DEFAULT_MODEL  = "checkpoints/keyword_spotting_combined.tflite"
+DEFAULT_CONFIG = "checkpoints/preprocess_config.json"
 
 
 # ── Mel spectrogram ───────────────────────────────────────────────────────────
