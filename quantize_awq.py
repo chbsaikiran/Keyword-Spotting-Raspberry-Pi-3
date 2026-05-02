@@ -242,6 +242,50 @@ def apply_awq_scales(
 
 # ── TFLite export ─────────────────────────────────────────────────────────────
 
+def _find_inputs_vec_offset(buf: bytes) -> int:
+    """
+    Navigate the TFLite flatbuffer hierarchy to find subgraph[0].inputs vector.
+
+    TFLite flatbuffer layout (FlatBuffers format):
+      buf[0:4]  → uint32 absolute offset to root Model table
+      Model.subgraphs  = field index 2 in Model's vtable
+      SubGraph.inputs  = field index 1 in SubGraph's vtable
+
+    Returns the absolute offset of the inputs vector's count field, or -1.
+    """
+    try:
+        root   = struct.unpack_from("<I", buf, 0)[0]
+        vtbl   = root + struct.unpack_from("<i", buf, root)[0]
+
+        # Model.subgraphs = field 2 → vtable entry at vtbl + 4 + 2*2
+        sg_voff = struct.unpack_from("<H", buf, vtbl + 4 + 2 * 2)[0]
+        if sg_voff == 0:
+            return -1
+        sg_ptr = root + sg_voff
+        sg_vec = sg_ptr + struct.unpack_from("<I", buf, sg_ptr)[0]
+
+        if struct.unpack_from("<I", buf, sg_vec)[0] == 0:
+            return -1
+        sg0_slot = sg_vec + 4
+        sg0      = sg0_slot + struct.unpack_from("<I", buf, sg0_slot)[0]
+
+        sg_vtbl  = sg0 + struct.unpack_from("<i", buf, sg0)[0]
+
+        # SubGraph.inputs = field 1 → vtable entry at sg_vtbl + 4 + 1*2
+        inp_voff = struct.unpack_from("<H", buf, sg_vtbl + 4 + 1 * 2)[0]
+        if inp_voff == 0:
+            return -1
+        inp_ptr  = sg0 + inp_voff
+        inp_vec  = inp_ptr + struct.unpack_from("<I", buf, inp_ptr)[0]
+
+        count = struct.unpack_from("<I", buf, inp_vec)[0]
+        if count == 0 or count > 200:
+            return -1
+        return inp_vec
+    except Exception:
+        return -1
+
+
 def _fix_hidden_inputs(int8_bytes: bytes) -> bytes:
     """
     Remove weight tensors from the subgraph inputs list via a targeted
@@ -254,23 +298,26 @@ def _fix_hidden_inputs(int8_bytes: bytes) -> bytes:
     declared input to be supplied via set_tensor() and raises
     'Input tensor N lacks data' without them.
 
-    We patch only the 4-byte count field of the inputs vector — no
-    re-serialisation, no buffer data touched.  The weight tensors remain as
-    embedded constants; they just stop being declared as external inputs.
+    Primary path: navigate the flatbuffer object hierarchy directly — avoids
+    false-positive matches on tensor shape vectors or weight data that share
+    the same [count][int32...] binary layout as the inputs vector.
     """
-    try:
-        from tensorflow.lite.python import schema_py_generated as schema_fb
-    except ImportError:
-        print("  [Warning] schema_py_generated unavailable — "
-              "skipping hidden-input patch (Pi may raise 'lacks data').")
-        return int8_bytes
-
-    raw_model  = schema_fb.ModelT.InitFromPackedBuf(bytearray(int8_bytes), 0)
-    raw_inputs = list(raw_model.subgraphs[0].inputs)   # full flatbuffer list
-
     interp = tf.lite.Interpreter(model_content=bytes(int8_bytes))
     interp.allocate_tensors()
     py_inputs = {d["index"] for d in interp.get_input_details()}
+
+    # Determine which tensor indices are in the flatbuffer's inputs list
+    # but not exposed by the interpreter (i.e. weight tensors lifted by PT2E).
+    buf = bytearray(int8_bytes)
+    vec_pos = _find_inputs_vec_offset(bytes(buf))
+    if vec_pos < 0:
+        print("  [Warning] Could not locate inputs vector in flatbuffer — "
+              "skipping hidden-input patch (Pi may raise 'lacks data').")
+        return int8_bytes
+
+    count      = struct.unpack_from("<I", buf, vec_pos)[0]
+    raw_inputs = [struct.unpack_from("<i", buf, vec_pos + 4 + j * 4)[0]
+                  for j in range(count)]
 
     hidden = [idx for idx in raw_inputs if idx not in py_inputs]
     if not hidden:
@@ -279,37 +326,16 @@ def _fix_hidden_inputs(int8_bytes: bytes) -> bytes:
 
     print(f"  Hidden weight tensor(s) in inputs list: {hidden}")
 
-    # Build the exact byte pattern for the inputs vector as it sits in the
-    # flatbuffer: [uint32 count][int32 tensor_0][int32 tensor_1]...
-    # raw_inputs order matches the flatbuffer storage order.
-    pattern = struct.pack("<I", len(raw_inputs))
-    for idx in raw_inputs:
-        pattern += struct.pack("<i", idx)
+    new_entries = [e for e in raw_inputs if e not in set(hidden)]
+    struct.pack_into("<I", buf, vec_pos, len(new_entries))
+    for j, e in enumerate(new_entries):
+        struct.pack_into("<i", buf, vec_pos + 4 + j * 4, e)
+    for j in range(len(new_entries), count):
+        struct.pack_into("<i", buf, vec_pos + 4 + j * 4, 0)
 
-    buf     = bytearray(int8_bytes)
-    found   = []
-
-    # Flatbuffers aligns all table data to 4 bytes — search on that boundary.
-    for i in range(0, len(buf) - len(pattern) + 1, 4):
-        if buf[i : i + len(pattern)] == pattern:
-            found.append(i)
-
-    # Fallback: byte-by-byte in case alignment differs.
-    if not found:
-        for i in range(len(buf) - len(pattern) + 1):
-            if buf[i : i + len(pattern)] == pattern:
-                found.append(i)
-
-    if len(found) == 1:
-        struct.pack_into("<I", buf, found[0], 1)   # set count = 1 (mel only)
-        print(f"  Patched subgraph inputs: removed {len(hidden)} "
-              f"weight tensor(s) {hidden} — kept only mel tensor.")
-        return bytes(buf)
-
-    print(f"  [Warning] Expected 1 match for inputs-vector pattern, "
-          f"found {len(found)}.  Model left unpatched — Pi will likely "
-          f"fail with 'Input tensor N lacks data'.")
-    return int8_bytes
+    print(f"  Patched subgraph inputs: removed {len(hidden)} "
+          f"weight tensor(s) {hidden} — kept only declared inputs.")
+    return bytes(buf)
 
 
 def export_tflite(model: nn.Module, tflite_path: str):
