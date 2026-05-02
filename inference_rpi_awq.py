@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import struct
 import time
 
 import numpy as np
@@ -43,6 +44,62 @@ except ImportError:
 
 DEFAULT_MODEL  = "checkpoints/keyword_spotting_awq.tflite"
 DEFAULT_CONFIG = "checkpoints/preprocess_config.json"
+
+
+def _patch_hidden_inputs(model_bytes: bytes, hidden_indices: list) -> bytes:
+    """
+    Remove hidden weight tensors from the TFLite subgraph inputs list in-place.
+
+    PT2E lifts nn.Parameter values into the subgraph inputs list.  Newer
+    tf.lite auto-initialises them from the flatbuffer buffer data; older
+    tflite_runtime on the Pi does not and raises "Input tensor N lacks data".
+
+    We scan the flatbuffer for the encoded inputs vector and rewrite only its
+    4-byte count field so those extra tensors are no longer declared inputs.
+    The weight data itself is untouched.
+    """
+    buf = bytearray(model_bytes)
+    for hidden_idx in hidden_indices:
+        # Try shrinking the declared-input count from (k+1) → k by locating
+        # the exact byte pattern for each count value that contains hidden_idx.
+        patched = False
+        # Search for any inputs vector that contains hidden_idx.
+        # Pattern: [uint32 count][int32 t0][int32 t1]...[int32 hidden_idx]...
+        # We try count values from 1 upward (up to 20 extra inputs).
+        for count in range(2, 22):
+            # Build all plausible orderings that include hidden_idx.
+            # Rather than brute-force permutations, scan raw bytes for
+            # the count header followed somewhere by hidden_idx.
+            count_bytes = struct.pack("<I", count)
+            hi_bytes    = struct.pack("<i", hidden_idx)
+            clen        = len(count_bytes)
+            hlen        = len(hi_bytes)
+            window      = clen + count * 4  # exact vector size in bytes
+            i = 0
+            while i <= len(buf) - window:
+                if buf[i:i + clen] == count_bytes:
+                    segment = buf[i:i + window]
+                    # Check alignment: all entries are int32 at 4-byte offsets
+                    entries = [
+                        struct.unpack_from("<i", segment, clen + j * 4)[0]
+                        for j in range(count)
+                    ]
+                    if hidden_idx in entries:
+                        # Patch: write (count - 1) and remove hidden_idx entry
+                        new_entries = [e for e in entries if e != hidden_idx]
+                        new_count   = len(new_entries)
+                        new_seg     = bytearray(struct.pack("<I", new_count))
+                        for e in new_entries:
+                            new_seg += struct.pack("<i", e)
+                        # Pad remaining bytes with zeros to preserve offsets
+                        new_seg += b'\x00' * (window - len(new_seg))
+                        buf[i:i + window] = new_seg
+                        patched = True
+                        break
+                i += 4  # TFLite vectors are 4-byte aligned
+            if patched:
+                break
+    return bytes(buf)
 
 
 # ── Mel spectrogram ───────────────────────────────────────────────────────────
@@ -144,54 +201,61 @@ class AWQSpotter:
             self.cfg = json.load(f)
         self.keywords = self.cfg["keywords"]
 
-        self.interpreter = tflite.Interpreter(
-            model_path=model_path,
-            num_threads=4,
-        )
-        self.interpreter.allocate_tensors()
-
         n_mels, max_frames = self.cfg["n_mels"], self.cfg["max_frames"]
-
-        input_details  = self.interpreter.get_input_details()
-        self._out_idx  = self.interpreter.get_output_details()[0]["index"]
-
-        # First declared input is always the mel spectrogram.
-        self._inp_idx      = input_details[0]["index"]
-        self._extra_inputs = []  # [(tensor_index, numpy_data), ...]
-
-        # Any additional declared inputs (shape != mel) are extra parameters.
         mel_shape = [1, max_frames, n_mels]
-        for det in input_details[1:]:
-            shape = [int(x) for x in det["shape"]]
-            self._extra_inputs.append((det["index"],
-                                       self._make_cls_data(shape, det["dtype"])))
 
-        # Build a lookup from index → tensor detail for the probe below.
-        td_by_idx: dict = {}
-        try:
-            for td in self.interpreter.get_tensor_details():
-                td_by_idx[td["index"]] = td
-        except AttributeError:
-            pass
+        with open(model_path, "rb") as f:
+            model_bytes = f.read()
 
-        # ── Probe invoke with a dummy mel input to verify the model is clean. ──
-        dummy = np.zeros([1, max_frames, n_mels], dtype=np.float32)
-        self.interpreter.set_tensor(self._inp_idx, dummy)
-        for idx, data in self._extra_inputs:
-            self.interpreter.set_tensor(idx, data)
-        try:
-            self.interpreter.invoke()
-        except RuntimeError as exc:
-            m = re.search(r'Input tensor (\d+) lacks data', str(exc))
-            if m:
-                raise RuntimeError(
-                    f"\nInput tensor {m.group(1)} lacks data.\n"
-                    f"The .tflite was built with an old quantize_awq.py that "
-                    f"left weight tensors in the subgraph inputs list.\n"
-                    f"Fix: re-run  python quantize_awq.py  on the training "
-                    f"machine, copy checkpoints/ to the Pi, then retry."
-                ) from exc
-            raise
+        hidden_found: list = []
+        for attempt in range(12):  # up to 12 hidden weight tensors
+            interp = tflite.Interpreter(model_content=model_bytes, num_threads=4)
+            interp.allocate_tensors()
+
+            input_details = interp.get_input_details()
+            out_idx       = interp.get_output_details()[0]["index"]
+            inp_idx       = input_details[0]["index"]
+            extra_inputs  = []
+            for det in input_details[1:]:
+                shape = [int(x) for x in det["shape"]]
+                extra_inputs.append((det["index"],
+                                     self._make_cls_data(shape, det["dtype"])))
+
+            dummy = np.zeros([1, max_frames, n_mels], dtype=np.float32)
+            interp.set_tensor(inp_idx, dummy)
+            for idx, data in extra_inputs:
+                interp.set_tensor(idx, data)
+
+            try:
+                interp.invoke()
+                # Probe succeeded — commit state and break
+                self.interpreter   = interp
+                self._inp_idx      = inp_idx
+                self._out_idx      = out_idx
+                self._extra_inputs = extra_inputs
+                break
+            except RuntimeError as exc:
+                m = re.search(r'Input tensor (\d+) lacks data', str(exc))
+                if not m:
+                    raise
+                bad = int(m.group(1))
+                if bad in hidden_found:
+                    raise RuntimeError(
+                        f"Patch loop stalled on tensor {bad}. "
+                        f"Cannot auto-fix this model."
+                    ) from exc
+                hidden_found.append(bad)
+                print(f"[AWQ] Auto-patching hidden weight tensor {bad} "
+                      f"(attempt {attempt + 1})…")
+                model_bytes = _patch_hidden_inputs(model_bytes, [bad])
+        else:
+            raise RuntimeError(
+                "Could not patch all hidden weight tensors after 12 attempts."
+            )
+
+        if hidden_found:
+            print(f"[AWQ] Patched {len(hidden_found)} hidden tensor(s): "
+                  f"{hidden_found}")
 
         print(f"[AWQ] Loaded: {model_path}")
         print(f"  Input shape  : {mel_shape}")
