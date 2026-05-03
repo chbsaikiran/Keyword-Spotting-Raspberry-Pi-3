@@ -255,7 +255,7 @@ def _find_inputs_vec_offset(buf: bytes) -> int:
     """
     try:
         root   = struct.unpack_from("<I", buf, 0)[0]
-        vtbl   = root + struct.unpack_from("<i", buf, root)[0]
+        vtbl   = root - struct.unpack_from("<i", buf, root)[0]  # vtable = obj - soffset
 
         # Model.subgraphs = field 2 → vtable entry at vtbl + 4 + 2*2
         sg_voff = struct.unpack_from("<H", buf, vtbl + 4 + 2 * 2)[0]
@@ -269,7 +269,7 @@ def _find_inputs_vec_offset(buf: bytes) -> int:
         sg0_slot = sg_vec + 4
         sg0      = sg0_slot + struct.unpack_from("<I", buf, sg0_slot)[0]
 
-        sg_vtbl  = sg0 + struct.unpack_from("<i", buf, sg0)[0]
+        sg_vtbl  = sg0 - struct.unpack_from("<i", buf, sg0)[0]  # vtable = obj - soffset
 
         # SubGraph.inputs = field 1 → vtable entry at sg_vtbl + 4 + 1*2
         inp_voff = struct.unpack_from("<H", buf, sg_vtbl + 4 + 1 * 2)[0]
@@ -338,6 +338,105 @@ def _fix_hidden_inputs(int8_bytes: bytes) -> bytes:
     return bytes(buf)
 
 
+def _embed_mmap_buffers(tflite_bytes: bytes) -> bytes:
+    """
+    Convert TFLite model from LiteRT mmap format (Buffer.offset + Buffer.size)
+    to classic embedded format (Buffer.data).
+
+    ai_edge_quantizer writes weights at raw file offsets via Buffer.offset/size.
+    Old tflite_runtime on RPi 3 only reads Buffer.data and sees every weight
+    buffer as empty, causing 'Input tensor N lacks data' for all constant tensors.
+
+    For each buffer with offset/size but no data we build a new FlatBuffer
+    Buffer table with the bytes embedded in Buffer.data, append it to the file,
+    and repoint the buffers-vector slot to it.  The old offset/size objects
+    become unreferenced dead bytes — no structural change to the rest of the model.
+
+    FlatBuffer vtable layout used here:
+        vtable = obj_address - soffset   (soffset stored as POSITIVE i32)
+        vtable: [vtable_size u16][obj_size u16][field0_off u16]...
+        field N offset in vtable: vtbl + 4 + N*2
+    """
+    orig = bytearray(tflite_bytes)
+
+    def u32(off): return struct.unpack_from("<I", orig, off)[0]
+    def i32(off): return struct.unpack_from("<i", orig, off)[0]
+    def u16(off): return struct.unpack_from("<H", orig, off)[0]
+    def i64(off): return struct.unpack_from("<q", orig, off)[0]
+    def u64(off): return struct.unpack_from("<Q", orig, off)[0]
+
+    # Model.buffers = field 4 → vtable[4 + 4*2] = vtable[12]
+    root     = u32(0)
+    vtbl     = root - i32(root)
+    bufs_off = u16(vtbl + 12)
+    if not bufs_off:
+        return tflite_bytes
+    bufs_ptr = root + bufs_off
+    bufs_vec = bufs_ptr + u32(bufs_ptr)
+    bufs_cnt = u32(bufs_vec)
+
+    extra       = bytearray()
+    n_converted = 0
+
+    for bidx in range(bufs_cnt):
+        slot_pos = bufs_vec + 4 + bidx * 4
+        bobj     = slot_pos + u32(slot_pos)
+        bvtbl    = bobj - i32(bobj)
+        bvtsz    = u16(bvtbl)
+
+        # Buffer schema fields:
+        #   field 0 (data)   → vtable[4]
+        #   field 1 (offset) → vtable[6]
+        #   field 2 (size)   → vtable[8]
+        data_voff = u16(bvtbl + 4) if bvtsz >= 6  else 0
+        off_voff  = u16(bvtbl + 6) if bvtsz >= 8  else 0
+        size_voff = u16(bvtbl + 8) if bvtsz >= 10 else 0
+
+        if data_voff or not off_voff or not size_voff:
+            continue  # already embedded, or no mmap data to convert
+
+        file_off = i64(bobj + off_voff)
+        file_sz  = u64(bobj + size_voff)
+        if file_sz == 0:
+            continue
+
+        data_bytes = bytes(orig[file_off : file_off + file_sz])
+
+        # Pad so that (len(orig)+len(extra)+20) % 16 == 0, satisfying
+        # force_align:16 for Buffer.data (data bytes land at P+20, 16-byte aligned).
+        # This also ensures P is 4-byte aligned (since 20 % 4 == 0).
+        while (len(orig) + len(extra) + 20) % 16 != 0:
+            extra.append(0)
+        P = len(orig) + len(extra)
+
+        # New Buffer table layout starting at P:
+        #   P+0  .. P+5  : vtable [vtable_size=6, obj_size=8, field0_at=4]
+        #   P+6  .. P+7  : 2-byte alignment pad
+        #   P+8  .. P+11 : soffset = 8  (table_pos − vtable_pos = (P+8) − P)
+        #   P+12 .. P+15 : data field = 4  (vector is 4 bytes ahead of this field)
+        #   P+16 .. P+19 : vector count = len(data_bytes)
+        #   P+20 ..      : data bytes  (16-byte aligned ✓)
+        extra.extend(struct.pack("<HHH", 6, 8, 4))           # vtable
+        extra.extend(b"\x00\x00")                             # alignment pad
+        extra.extend(struct.pack("<i", 8))                    # soffset
+        extra.extend(struct.pack("<I", 4))                    # data field → vector
+        extra.extend(struct.pack("<I", len(data_bytes)))      # vector count
+        extra.extend(data_bytes)                              # vector data
+
+        # Repoint the buffers-vector slot to the new table (at P+8)
+        table_pos = P + 8
+        struct.pack_into("<I", orig, slot_pos, table_pos - slot_pos)
+        n_converted += 1
+
+    if n_converted == 0:
+        return tflite_bytes
+
+    print(f"  Converted {n_converted}/{bufs_cnt} buffers: "
+          f"mmap (offset/size) → embedded (Buffer.data), "
+          f"classic format for old tflite_runtime")
+    return bytes(orig) + bytes(extra)
+
+
 def export_tflite(model: nn.Module, tflite_path: str):
     """AWQ-transformed PyTorch model → TFLite INT8 via litert-torch + ai_edge_quantizer."""
     model = model.eval()
@@ -353,6 +452,7 @@ def export_tflite(model: nn.Module, tflite_path: str):
         granularity=aq.qtyping.QuantGranularity.CHANNELWISE,
     )
     int8_bytes = _fix_hidden_inputs(bytes(qt.quantize().quantized_model))
+    int8_bytes = _embed_mmap_buffers(int8_bytes)
 
     os.makedirs(os.path.dirname(os.path.abspath(tflite_path)), exist_ok=True)
     with open(tflite_path, "wb") as f:

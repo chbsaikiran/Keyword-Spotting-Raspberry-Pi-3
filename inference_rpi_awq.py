@@ -48,128 +48,78 @@ DEFAULT_CONFIG = "checkpoints/preprocess_config.json"
 
 def _find_inputs_vec_offset(buf: bytes) -> int:
     """
-    Navigate the TFLite flatbuffer hierarchy to find subgraph[0].inputs vector.
+    Navigate TFLite flatbuffer to SubGraph[0].inputs vector.
 
-    TFLite flatbuffer layout (FlatBuffers format):
-      buf[0:4]  → uint32 absolute offset to root Model table
-      Model.subgraphs  = field index 2 in Model's vtable
-      SubGraph.inputs  = field index 1 in SubGraph's vtable
+    Returns the absolute byte offset of the vector's count field, or -1 on
+    failure.  Pure structural navigation — no content validation — so it can
+    never accidentally land on an operator's inputs list.
 
-    Returns the absolute offset of the inputs vector's count field, or -1.
+    FlatBuffers vtable layout:
+        [u16 vtable_size][u16 obj_size][u16 field0_off][u16 field1_off]...
+    Field offsets are from the START of the enclosing table object.
+
+    TFLite schema field IDs used here:
+        Model.subgraphs  = field 2  →  vtable[4 + 2*2] = vtable[8]
+        SubGraph.inputs  = field 1  →  vtable[4 + 1*2] = vtable[6]
     """
     try:
-        # Root table (Model) absolute position
-        root = struct.unpack_from("<I", buf, 0)[0]
-
-        # Each FlatBuffers table begins with a signed int32 (soffset_t) whose
-        # value, added to the table position, gives the vtable position.
-        vtbl = root + struct.unpack_from("<i", buf, root)[0]
-
-        # vtable layout: [uint16 vtbl_bytes][uint16 obj_bytes][field0 uint16]...
-        # Model.subgraphs is field index 2 → vtable entry at vtbl + 4 + 2*2
-        sg_voff = struct.unpack_from("<H", buf, vtbl + 4 + 2 * 2)[0]
-        if sg_voff == 0:
-            return -1  # field absent
-
-        # The field slot holds a uoffset_t (uint32) pointing forward to the vector
-        sg_ptr = root + sg_voff
-        sg_vec = sg_ptr + struct.unpack_from("<I", buf, sg_ptr)[0]
-
-        # Vector of SubGraph tables: [uint32 count][uoffset_0][uoffset_1]...
-        # Each uoffset is relative to its own 4-byte slot.
-        if struct.unpack_from("<I", buf, sg_vec)[0] == 0:
-            return -1  # no subgraphs
-        sg0_slot = sg_vec + 4
-        sg0 = sg0_slot + struct.unpack_from("<I", buf, sg0_slot)[0]
-
-        # SubGraph[0] vtable
-        sg_vtbl = sg0 + struct.unpack_from("<i", buf, sg0)[0]
-
-        # SubGraph.inputs is field index 1 → vtable entry at sg_vtbl + 4 + 1*2
-        inp_voff = struct.unpack_from("<H", buf, sg_vtbl + 4 + 1 * 2)[0]
-        if inp_voff == 0:
-            return -1  # field absent
-
-        # inputs is a vector of int32 scalars (not a vector of tables)
-        inp_ptr = sg0 + inp_voff
-        inp_vec = inp_ptr + struct.unpack_from("<I", buf, inp_ptr)[0]
-
-        # Sanity check: count should be a small positive number
-        count = struct.unpack_from("<I", buf, inp_vec)[0]
-        if count == 0 or count > 200:
+        root     = struct.unpack_from("<I", buf, 0)[0]
+        vtbl     = root + struct.unpack_from("<i", buf, root)[0]
+        # Model vtable must cover at least 3 fields (version, op_codes, subgraphs)
+        if struct.unpack_from("<H", buf, vtbl)[0] < 10:
             return -1
-
+        sg_voff  = struct.unpack_from("<H", buf, vtbl + 8)[0]
+        if not sg_voff:
+            return -1
+        sg_ptr   = root + sg_voff
+        sg_vec   = sg_ptr + struct.unpack_from("<I", buf, sg_ptr)[0]
+        if struct.unpack_from("<I", buf, sg_vec)[0] == 0:
+            return -1
+        sg0_slot = sg_vec + 4
+        sg0      = sg0_slot + struct.unpack_from("<I", buf, sg0_slot)[0]
+        sg_vtbl  = sg0 + struct.unpack_from("<i", buf, sg0)[0]
+        # SubGraph vtable must cover at least 2 fields (tensors, inputs)
+        if struct.unpack_from("<H", buf, sg_vtbl)[0] < 8:
+            return -1
+        inp_voff = struct.unpack_from("<H", buf, sg_vtbl + 6)[0]
+        if not inp_voff:
+            return -1
+        inp_ptr  = sg0 + inp_voff
+        inp_vec  = inp_ptr + struct.unpack_from("<I", buf, inp_ptr)[0]
+        count    = struct.unpack_from("<I", buf, inp_vec)[0]
+        if not (0 <= count <= 512):
+            return -1
         return inp_vec
     except Exception:
         return -1
 
 
 def _patch_hidden_inputs(model_bytes: bytes, hidden_indices: list,
-                         anchor_idx: int = -1) -> bytes:
+                         known_inputs: list = None) -> bytes:
     """
-    Remove hidden weight tensors from the TFLite subgraph inputs list in-place.
+    Remove hidden weight tensors from SubGraph[0].inputs list in-place.
 
-    PT2E lifts nn.Parameter values into the subgraph inputs list.  Newer
-    tf.lite auto-initialises them from the flatbuffer buffer data; older
-    tflite_runtime on the Pi does not and raises "Input tensor N lacks data".
-
-    Primary path: navigate the flatbuffer object hierarchy to find the exact
-    offset of the inputs vector — immune to false-positive matches on weight
-    data or tensor shape vectors (which share the same [count][int32...] format).
-
-    Fallback: heuristic byte scan with anchor_idx to reduce false positives
-    (used only if flatbuffer navigation fails for any reason).
+    Uses structural flatbuffer navigation only.  Content-based scanning is
+    intentionally absent: it can match an operator's inputs vector (e.g.
+    [activation=0, weight=35, bias=63]) and corrupt the model.
     """
-    buf = bytearray(model_bytes)
+    buf        = bytearray(model_bytes)
     hidden_set = set(hidden_indices)
 
-    # ── Primary: proper flatbuffer navigation ─────────────────────────────────
     vec_pos = _find_inputs_vec_offset(bytes(buf))
-    if vec_pos >= 0:
-        count = struct.unpack_from("<I", buf, vec_pos)[0]
-        entries = [
-            struct.unpack_from("<i", buf, vec_pos + 4 + j * 4)[0]
-            for j in range(count)
-        ]
-        new_entries = [e for e in entries if e not in hidden_set]
-        if len(new_entries) < count:
-            struct.pack_into("<I", buf, vec_pos, len(new_entries))
-            for j, e in enumerate(new_entries):
-                struct.pack_into("<i", buf, vec_pos + 4 + j * 4, e)
-            # Zero the vacated slots so buffer size is unchanged
-            for j in range(len(new_entries), count):
-                struct.pack_into("<i", buf, vec_pos + 4 + j * 4, 0)
-        return bytes(buf)
+    if vec_pos < 0:
+        return model_bytes  # navigation failed — return unchanged
 
-    # ── Fallback: heuristic scan ───────────────────────────────────────────────
-    for hidden_idx in hidden_indices:
-        patched = False
-        for count in range(2, 32):
-            count_bytes = struct.pack("<I", count)
-            clen        = len(count_bytes)
-            window      = clen + count * 4
-            i = 0
-            while i <= len(buf) - window:
-                if buf[i:i + clen] == count_bytes:
-                    segment = buf[i:i + window]
-                    entries = [
-                        struct.unpack_from("<i", segment, clen + j * 4)[0]
-                        for j in range(count)
-                    ]
-                    anchor_ok = (anchor_idx < 0) or (anchor_idx in entries)
-                    if hidden_idx in entries and anchor_ok:
-                        new_entries = [e for e in entries if e != hidden_idx]
-                        new_count   = len(new_entries)
-                        new_seg     = bytearray(struct.pack("<I", new_count))
-                        for e in new_entries:
-                            new_seg += struct.pack("<i", e)
-                        new_seg += b'\x00' * (window - len(new_seg))
-                        buf[i:i + window] = new_seg
-                        patched = True
-                        break
-                i += 4
-            if patched:
-                break
+    count       = struct.unpack_from("<I", buf, vec_pos)[0]
+    entries     = [struct.unpack_from("<i", buf, vec_pos + 4 + j * 4)[0]
+                   for j in range(count)]
+    new_entries = [e for e in entries if e not in hidden_set]
+    if len(new_entries) < count:
+        struct.pack_into("<I", buf, vec_pos, len(new_entries))
+        for j, e in enumerate(new_entries):
+            struct.pack_into("<i", buf, vec_pos + 4 + j * 4, e)
+        for j in range(len(new_entries), count):
+            struct.pack_into("<i", buf, vec_pos + 4 + j * 4, 0)
     return bytes(buf)
 
 
@@ -278,8 +228,17 @@ class AWQSpotter:
         with open(model_path, "rb") as f:
             model_bytes = f.read()
 
+        # Old tflite_runtime requires every tensor in the flatbuffer inputs list to
+        # be set via set_tensor() — including weight/bias tensors that newer runtimes
+        # auto-initialise from the buffer.  Those constant tensors have no arena
+        # allocation, so set_tensor() raises "Tensor is unallocated".
+        # The only fix is to remove them from the flatbuffer inputs list so the
+        # runtime treats them as buffer-backed constants and never asks for them.
+        # We discover hidden tensors one by one via "Input tensor N lacks data"
+        # and patch them out using binary flatbuffer editing.
         hidden_found: list = []
-        for attempt in range(12):  # up to 12 hidden weight tensors
+
+        for attempt in range(12):
             interp = tflite.Interpreter(model_content=model_bytes, num_threads=4)
             interp.allocate_tensors()
 
@@ -291,6 +250,9 @@ class AWQSpotter:
                 shape = [int(x) for x in det["shape"]]
                 extra_inputs.append((det["index"],
                                      self._make_cls_data(shape, det["dtype"])))
+            # All visible input indices — used to anchor the patch search so it
+            # finds the subgraph inputs vector instead of an operator's inputs list.
+            known_inputs = [inp_idx] + [d["index"] for d in input_details[1:]]
 
             dummy = np.zeros([1, max_frames, n_mels], dtype=np.float32)
             interp.set_tensor(inp_idx, dummy)
@@ -299,7 +261,6 @@ class AWQSpotter:
 
             try:
                 interp.invoke()
-                # Probe succeeded — commit state and break
                 self.interpreter   = interp
                 self._inp_idx      = inp_idx
                 self._out_idx      = out_idx
@@ -316,10 +277,10 @@ class AWQSpotter:
                         f"Cannot auto-fix this model."
                     ) from exc
                 hidden_found.append(bad)
-                print(f"[AWQ] Auto-patching hidden weight tensor {bad} "
+                print(f"[AWQ] Patching hidden tensor {bad} "
                       f"(attempt {attempt + 1})…")
-                model_bytes = _patch_hidden_inputs(model_bytes, [bad],
-                                                   anchor_idx=inp_idx)
+                model_bytes = _patch_hidden_inputs(
+                    model_bytes, [bad], known_inputs=known_inputs)
         else:
             raise RuntimeError(
                 "Could not patch all hidden weight tensors after 12 attempts."
