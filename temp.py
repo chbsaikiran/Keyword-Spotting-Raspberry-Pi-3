@@ -1,7 +1,18 @@
-import tflite_runtime.interpreter as tflite
+# import numpy as np
 
-interp = tflite.Interpreter(model_path="checkpoints/keyword_spotting_awq.tflite")
-interp.allocate_tensors()
+# float1 = 22.34567
+# float2 = 22.34667
+# float3 = 22.34767
+# float4 = 22.34867
 
-for t in interp.get_tensor_details():
-    print(t['index'], t['name'], t['shape'])
+# arr1 = np.array([float1, float2])
+# arr1_f = arr1.astype(np.float32)
+# arr2 = np.array([float3, float4])
+# arr2_f = arr2.astype(np.float32)
+
+# print(arr1_f+arr2_f)
+
+#import tflite_runtime
+import tensorflow as tf
+
+print(tf.__version__)
