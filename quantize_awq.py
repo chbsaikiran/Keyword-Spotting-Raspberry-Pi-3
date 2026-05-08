@@ -298,16 +298,18 @@ def _fix_hidden_inputs(int8_bytes: bytes) -> bytes:
     declared input to be supplied via set_tensor() and raises
     'Input tensor N lacks data' without them.
 
-    Primary path: navigate the flatbuffer object hierarchy directly — avoids
-    false-positive matches on tensor shape vectors or weight data that share
-    the same [count][int32...] binary layout as the inputs vector.
+    Detection strategy: weight/bias tensors are INT8 or INT32 after quantization;
+    real runtime inputs (mel spectrogram, cls_token) remain FLOAT32.  Using dtype
+    to classify tensors is version-agnostic — TF 2.13 and newer TF differ in what
+    get_input_details() reports, but tensor dtypes are stable across versions.
     """
     interp = tf.lite.Interpreter(model_content=bytes(int8_bytes))
     interp.allocate_tensors()
-    py_inputs = {d["index"] for d in interp.get_input_details()}
 
-    # Determine which tensor indices are in the flatbuffer's inputs list
-    # but not exposed by the interpreter (i.e. weight tensors lifted by PT2E).
+    # Build dtype map for every tensor — weight/bias tensors are INT8/INT32,
+    # real runtime inputs (mel, cls_token) stay FLOAT32.
+    tensor_dtype = {t["index"]: t["dtype"] for t in interp.get_tensor_details()}
+
     buf = bytearray(int8_bytes)
     vec_pos = _find_inputs_vec_offset(bytes(buf))
     if vec_pos < 0:
@@ -319,7 +321,9 @@ def _fix_hidden_inputs(int8_bytes: bytes) -> bytes:
     raw_inputs = [struct.unpack_from("<i", buf, vec_pos + 4 + j * 4)[0]
                   for j in range(count)]
 
-    hidden = [idx for idx in raw_inputs if idx not in py_inputs]
+    # Any non-FLOAT32 input is a quantized weight/bias constant lifted by PT2E.
+    hidden = [idx for idx in raw_inputs
+              if tensor_dtype.get(idx) != np.float32]
     if not hidden:
         print("  No hidden inputs found — model is already clean.")
         return int8_bytes
@@ -449,7 +453,7 @@ def export_tflite(model: nn.Module, tflite_path: str):
         regex=".*",
         operation_name=aq._TFLOpName.FULLY_CONNECTED,
         num_bits=8,
-        granularity=aq.qtyping.QuantGranularity.CHANNELWISE,
+        granularity=aq.qtyping.QuantGranularity.TENSORWISE,
     )
     int8_bytes = _fix_hidden_inputs(bytes(qt.quantize().quantized_model))
     int8_bytes = _embed_mmap_buffers(int8_bytes)
@@ -477,11 +481,33 @@ def eval_pytorch(model: nn.Module, dataloader: DataLoader, n: int = 30) -> float
     return correct / total
 
 
-def eval_tflite(tflite_path: str, dataloader: DataLoader, n: int = 30) -> float:
+def eval_tflite(tflite_path: str, dataloader: DataLoader,
+                cls_token: np.ndarray = None, n: int = 30) -> float:
     interp = tf.lite.Interpreter(model_path=tflite_path)
     interp.allocate_tensors()
-    inp_idx = interp.get_input_details()[0]["index"]
+    input_details = interp.get_input_details()
     out_idx = interp.get_output_details()[0]["index"]
+
+    # Locate mel input by shape — do not assume index [0]; TF 2.13 and newer TF
+    # differ in the order and set of tensors returned by get_input_details().
+    mel_shape = [1, MAX_FRAMES, N_MELS]
+    inp_idx = next(
+        (d["index"] for d in input_details if list(d["shape"]) == mel_shape),
+        input_details[0]["index"],
+    )
+
+    # Any remaining float32 inputs are runtime parameters (e.g. cls_token).
+    extra_inputs = []
+    for d in input_details:
+        if d["index"] == inp_idx:
+            continue
+        shape = [int(x) for x in d["shape"]]
+        n_elem = int(np.prod(shape)) if shape else 1
+        if cls_token is not None and n_elem == int(np.prod(cls_token.shape)):
+            data = cls_token.reshape(shape).astype(d["dtype"])
+        else:
+            data = np.zeros(shape, dtype=d["dtype"])
+        extra_inputs.append((d["index"], data))
 
     correct = total = 0
     for i, (mel, labels) in enumerate(dataloader):
@@ -489,6 +515,8 @@ def eval_tflite(tflite_path: str, dataloader: DataLoader, n: int = 30) -> float:
             break
         for j in range(mel.shape[0]):
             interp.set_tensor(inp_idx, mel[j : j + 1].numpy())
+            for idx, data in extra_inputs:
+                interp.set_tensor(idx, data)
             interp.invoke()
             logits = interp.get_tensor(out_idx)[0]
             correct += int(logits.argmax() == labels[j].item())
@@ -543,7 +571,8 @@ def main():
     # ── Accuracy comparison ───────────────────────────────────────────────────
     print("\nValidating (30 batches each)...")
     acc_fp32  = eval_pytorch(model_awq, val_dl, n=30)
-    acc_tflite = eval_tflite(TFLITE_PATH, val_dl, n=30)
+    cls_token_np = model_awq.cls_token.detach().numpy()
+    acc_tflite = eval_tflite(TFLITE_PATH, val_dl, cls_token=cls_token_np, n=30)
     print(f"  FP32  (AWQ) : {acc_fp32:.4f}")
     print(f"  INT8 TFLite : {acc_tflite:.4f}")
     print(f"  Accuracy drop: {acc_fp32 - acc_tflite:.4f}")
